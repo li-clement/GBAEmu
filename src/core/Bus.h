@@ -6,13 +6,15 @@
 namespace Core {
 
 class APU; // Forward decl
+class CPU; // Forward decl
 
 class Bus {
 public:
   Bus();
   ~Bus();
 
-  void setAPU(APU *apu);
+  void setAPU(APU *apu) { this->apu = apu; }
+  void setCPU(CPU *cpu) { this->cpu = cpu; }
 
   // Basic memory access
   template <typename T> T read(uint32_t addr);
@@ -35,7 +37,7 @@ public:
   void loadROM(const std::vector<uint8_t> &data);
 
 private:
-  std::vector<uint8_t> bios;       // 16KB BIOS
+  std::vector<uint8_t> bios; // 16KB BIOS
   bool vectorTableWritable_ = true; // 无 BIOS 时可写 0x00-0x3F；有 BIOS 时只读
   std::vector<uint8_t> wram_board; // 256KB On-board WRAM
   std::vector<uint8_t> wram_chip;  // 32KB On-chip WRAM
@@ -52,6 +54,7 @@ private:
   // 08000000-.......  Game ROM
 
   APU *apu = nullptr;
+  CPU *cpu = nullptr;
 };
 
 } // namespace Core

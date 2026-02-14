@@ -24,12 +24,26 @@ void PPU::renderScanline(int line, uint32_t *buffer) {
   uint16_t dispcnt = bus->read16(0x04000000 + IO::DISPCNT);
   int mode = dispcnt & IO::DISPCNT_MODE_MASK;
 
+  static int logCounter = 0;
+  if (line == 80 && logCounter++ % 60 == 0) {
+    printf("PPU: Line 80 Mode=%d CNT=%04X BG0=%d BG1=%d BG2=%d BG3=%d OBJ=%d\n",
+           mode, dispcnt, (dispcnt & IO::DISPCNT_BG0_ENABLE) ? 1 : 0,
+           (dispcnt & IO::DISPCNT_BG1_ENABLE) ? 1 : 0,
+           (dispcnt & IO::DISPCNT_BG2_ENABLE) ? 1 : 0,
+           (dispcnt & IO::DISPCNT_BG3_ENABLE) ? 1 : 0,
+           (dispcnt & IO::DISPCNT_OBJ_ENABLE) ? 1 : 0);
+  }
+
   if (mode == 0 || mode == 1) {
     // Mode 0/1: Tiled layers (all 4 BGs; priority handled by draw order)
-    if (dispcnt & IO::DISPCNT_BG0_ENABLE) renderBackgroundLayer(line, buffer, 0);
-    if (dispcnt & IO::DISPCNT_BG1_ENABLE) renderBackgroundLayer(line, buffer, 1);
-    if (dispcnt & IO::DISPCNT_BG2_ENABLE) renderBackgroundLayer(line, buffer, 2);
-    if (dispcnt & IO::DISPCNT_BG3_ENABLE) renderBackgroundLayer(line, buffer, 3);
+    if (dispcnt & IO::DISPCNT_BG0_ENABLE)
+      renderBackgroundLayer(line, buffer, 0);
+    if (dispcnt & IO::DISPCNT_BG1_ENABLE)
+      renderBackgroundLayer(line, buffer, 1);
+    if (dispcnt & IO::DISPCNT_BG2_ENABLE)
+      renderBackgroundLayer(line, buffer, 2);
+    if (dispcnt & IO::DISPCNT_BG3_ENABLE)
+      renderBackgroundLayer(line, buffer, 3);
   } else if (mode == 3) {
     // Mode 3: 240x160 15-bit bitmap, single frame at 0x06000000
     uint32_t lineBase = 0x06000000 + (line * 240 * 2);
@@ -55,7 +69,8 @@ void PPU::renderScanline(int line, uint32_t *buffer) {
       }
     }
   } else if (mode == 5) {
-    // Mode 5: 160x128 15-bit, two frames; we render 160-wide centered / scaled later if needed
+    // Mode 5: 160x128 15-bit, two frames; we render 160-wide centered / scaled
+    // later if needed
     uint32_t frameBase = (dispcnt & 0x10) ? 0x0600A000 : 0x06000000;
     if (line < 128) {
       uint32_t lineBase = frameBase + (line * 160 * 2);
@@ -81,9 +96,12 @@ void PPU::renderBackground(int line, uint32_t *buffer) {
 }
 
 void PPU::renderBackgroundLayer(int line, uint32_t *buffer, int bgIndex) {
-  static const uint32_t BGCNT_OFFS[] = {IO::BG0CNT, IO::BG1CNT, IO::BG2CNT, IO::BG3CNT};
-  static const uint32_t BGHOFS_OFFS[] = {IO::BG0HOFS, IO::BG1HOFS, IO::BG2HOFS, IO::BG3HOFS};
-  static const uint32_t BGVOFS_OFFS[] = {IO::BG0VOFS, IO::BG1VOFS, IO::BG2VOFS, IO::BG3VOFS};
+  static const uint32_t BGCNT_OFFS[] = {IO::BG0CNT, IO::BG1CNT, IO::BG2CNT,
+                                        IO::BG3CNT};
+  static const uint32_t BGHOFS_OFFS[] = {IO::BG0HOFS, IO::BG1HOFS, IO::BG2HOFS,
+                                         IO::BG3HOFS};
+  static const uint32_t BGVOFS_OFFS[] = {IO::BG0VOFS, IO::BG1VOFS, IO::BG2VOFS,
+                                         IO::BG3VOFS};
   uint32_t base = 0x04000000;
   uint16_t bgcnt = bus->read16(base + BGCNT_OFFS[bgIndex]);
   int charBaseBlock = (bgcnt >> 2) & 0x3;
@@ -109,8 +127,10 @@ void PPU::renderBackgroundLayer(int line, uint32_t *buffer, int bgIndex) {
     int paletteBank = (tileInfo >> 12) & 0xF;
     int localX = effectiveX % 8;
     int localY = y % 8;
-    if (hFlip) localX = 7 - localX;
-    if (vFlip) localY = 7 - localY;
+    if (hFlip)
+      localX = 7 - localX;
+    if (vFlip)
+      localY = 7 - localY;
 
     uint8_t index = 0;
     if (colorMode == 0) {
@@ -122,9 +142,9 @@ void PPU::renderBackgroundLayer(int line, uint32_t *buffer, int bgIndex) {
     }
 
     if (index != 0) {
-      uint32_t paletteAddr = colorMode == 0
-          ? (0x05000000 + (paletteBank * 32) + (index * 2))
-          : (0x05000000 + (index * 2));
+      uint32_t paletteAddr =
+          colorMode == 0 ? (0x05000000 + (paletteBank * 32) + (index * 2))
+                         : (0x05000000 + (index * 2));
       uint16_t color15 = bus->read16(paletteAddr);
       uint8_t r = expand5to8(color15 & 0x1F);
       uint8_t g = expand5to8((color15 >> 5) & 0x1F);

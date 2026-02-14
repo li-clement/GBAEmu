@@ -88,11 +88,33 @@
 @end
 
 // Main entry point
-int main(int /*argc*/, const char * /*argv*/[]) {
+int main(int argc, const char *argv[]) {
   @autoreleasepool {
     NSApplication *app = [NSApplication sharedApplication];
     AppDelegate *delegate = [[AppDelegate alloc] init];
     [app setDelegate:delegate];
+
+    // Check for command line arguments
+    if (argc > 1) {
+      NSString *path = [NSString stringWithUTF8String:argv[1]];
+      // We need to wait for app to launch to load ROM?
+      // Actually, we can just defer it or set a property on delegate.
+      // Let's use a delayed invocation or notification.
+      // Or better, just queue it on main loop.
+      dispatch_async(dispatch_get_main_queue(), ^{
+        NSData *data = [NSData dataWithContentsOfFile:path];
+        if (data) {
+          [delegate.metalView loadROM:data];
+          [delegate.window
+              setTitle:[NSString stringWithFormat:@"M1 GBA Emulator - %@",
+                                                  [path lastPathComponent]]];
+          NSLog(@"Loaded ROM from command line: %@", path);
+        } else {
+          NSLog(@"Failed to load ROM from command line: %@", path);
+        }
+      });
+    }
+
     [app run];
   }
   return 0;

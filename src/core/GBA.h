@@ -46,7 +46,7 @@ private:
   } timers[4];
 
   void updateTimers(int cycles);
-  void requestInterrupt(uint16_t flag);
+  void requestInterrupt(int id);
   void checkInterrupts();
 
   // DMA

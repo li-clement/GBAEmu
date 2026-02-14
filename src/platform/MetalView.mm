@@ -74,7 +74,8 @@ static const int kMaxInflightBuffers = 3;
 
   // GBA Core
   Core::GBA *_gba;
-  BOOL _loadedRealROM; // YES = ROM from file (skip test scene), NO = dummy (run test scene)
+  BOOL _loadedRealROM; // YES = ROM from file (skip test scene), NO = dummy (run
+                       // test scene)
 
   // Sync for Rendering
   id<MTLTexture> _displayTexture; // Texture currently being displayed
@@ -111,13 +112,13 @@ static const int kMaxInflightBuffers = 3;
       if (cwd.length)
         romDir = [cwd stringByAppendingPathComponent:@"rom"];
     }
-    NSString *romPath = [romDir
-        stringByAppendingPathComponent:@"Castlevania - Aria of Sorrow (USA).gba"];
+    NSString *romPath = [romDir stringByAppendingPathComponent:
+                                    @"Castlevania - Aria of Sorrow (USA).gba"];
     NSData *romFileData = [NSData dataWithContentsOfFile:romPath];
     if (!romFileData) {
       NSError *err = nil;
-      NSArray<NSString *> *contents =
-          [fm contentsOfDirectoryAtPath:romDir error:&err];
+      NSArray<NSString *> *contents = [fm contentsOfDirectoryAtPath:romDir
+                                                              error:&err];
       for (NSString *name in contents) {
         if ([name.lowercaseString hasSuffix:@".gba"]) {
           romPath = [romDir stringByAppendingPathComponent:name];
@@ -131,7 +132,8 @@ static const int kMaxInflightBuffers = 3;
             (unsigned long)romFileData.length);
       // 优先加载 BIOS（16KB）：gba_bios.bin 或 bios.bin
       NSData *biosData = nil;
-      NSString *biosPath = [romDir stringByAppendingPathComponent:@"gba_bios.bin"];
+      NSString *biosPath =
+          [romDir stringByAppendingPathComponent:@"gba_bios.bin"];
       biosData = [NSData dataWithContentsOfFile:biosPath];
       if (!biosData || biosData.length != 16384) {
         biosPath = [romDir stringByAppendingPathComponent:@"bios.bin"];
@@ -144,7 +146,8 @@ static const int kMaxInflightBuffers = 3;
         NSLog(@"Loaded BIOS from: %@ (%lu bytes)", biosPath,
               (unsigned long)biosData.length);
       } else if (biosData.length && biosData.length != 16384) {
-        NSLog(@"Skip BIOS: wrong size %lu (expected 16384)", (unsigned long)biosData.length);
+        NSLog(@"Skip BIOS: wrong size %lu (expected 16384)",
+              (unsigned long)biosData.length);
       }
       std::vector<uint8_t> romVec(romFileData.length);
       memcpy(romVec.data(), romFileData.bytes, romFileData.length);
@@ -159,7 +162,8 @@ static const int kMaxInflightBuffers = 3;
       _loadedRealROM = NO;
     }
 
-    // --- PPU TEST SCENE SETUP (only when using dummy ROM; skip for real game ROM) ---
+    // --- PPU TEST SCENE SETUP (only when using dummy ROM; skip for real game
+    // ROM) ---
     if (!_loadedRealROM) {
       auto &bus = _gba->getBus();
       bus.write16(0x04000000, 0x0100);
@@ -524,6 +528,11 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
 
     [renderEncoder endEncoding];
     [commandBuffer presentDrawable:view.currentDrawable];
+
+    static int logCount = 0;
+    if (logCount++ % 60 == 0) {
+      NSLog(@"Frame Presented");
+    }
   }
   [commandBuffer commit];
 }

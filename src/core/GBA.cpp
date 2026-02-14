@@ -14,6 +14,7 @@ GBA::GBA() {
   apu = std::make_unique<APU>();
 
   bus->setAPU(apu.get());
+  bus->setCPU(cpu.get());
 }
 
 GBA::~GBA() {}
@@ -175,20 +176,18 @@ void GBA::stepFrame(uint32_t *buffer, size_t stride) {
       }
     }
 
-    // Check for ROM entry
+    // Check for ROM entry (Moved logging to trace logic potentially?)
     static bool romEntered = false;
     if (!romEntered && cpu->getPC() >= 0x08000000) {
       romEntered = true;
       printf("GBAEmu: JUMP TO ROM CONFIRMED! PC=0x%08X\n", cpu->getPC());
     }
-    if (line < VISIBLE_LINES) {
-      size_t pixelStride = stride / 4;
-      ppu->renderScanline(line, buffer + (line * pixelStride));
-    }
+    // Duplicate renderScanline removed from here
 
     // VBlank 开始时触发 VBlank IRQ 和 DMA
     if (line == VISIBLE_LINES) {
       uint16_t dstat = bus->read16(0x04000004);
+      printf("GBA: VBlank Start. DISPSTAT=%04X\n", dstat);
       if (dstat & 0x8) {
         requestInterrupt(0x1); // VBlank IRQ
       }
@@ -476,22 +475,31 @@ void GBA::updateTimers(int cycles) {
   }
 }
 
-void GBA::requestInterrupt(uint16_t flag) {
-  uint32_t if_addr = 0x04000202;
-  uint16_t currentIF = bus->read16(if_addr);
-  bus->write16(if_addr, currentIF | flag);
+void GBA::requestInterrupt(int id) {
+  uint16_t if_reg = bus->read16(0x04000202);
+  bus->write16(0x04000202, if_reg | id);
+  printf("GBA: Request Interrupt ID=%X IF=%04X\n", id, if_reg | id);
+  checkInterrupts();
 }
 
 void GBA::checkInterrupts() {
-  uint16_t IE = bus->read16(0x04000200);
-  uint16_t IF = bus->read16(0x04000202);
-  uint16_t IME = bus->read16(0x04000208);
+  uint16_t ie = bus->read16(0x04000200);
+  uint16_t if_reg = bus->read16(0x04000202);
+  uint16_t ime = bus->read16(0x04000208);
 
-  // IME bit 0
-  if (IME & 1) {
-    if (IE & IF) {
+  // Throttle printing IME check or only print if IME=1?
+  if (ime & 1) {
+    if (ie & if_reg) {
+      printf("GBA: Firing CPU IRQ! IE&IF=%04X\n", ie & if_reg);
       cpu->irq();
+    } else {
+      // IME is on but no matching interrupt
+      // printf("GBA: IME=1 but IE&IF=0. IE=%04X IF=%04X\n", ie, if_reg);
     }
+  } else {
+    // IME is off
+    // if (ie & if_reg) printf("GBA: IRQ Pending but IME=0. IE=%04X IF=%04X\n",
+    // ie, if_reg);
   }
 }
 

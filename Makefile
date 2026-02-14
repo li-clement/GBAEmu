@@ -9,7 +9,7 @@ BUILD_DIR := build
 BIN_DIR := bin
 
 # Find all source files
-SRCS_CPP := $(shell find $(SRC_DIR) -name "*.cpp")
+SRCS_CPP := $(shell find $(SRC_DIR) -name "*.cpp" -not -path "$(SRC_DIR)/test/*")
 SRCS_MM := $(shell find $(SRC_DIR) -name "*.mm")
 
 # Generate object file paths
@@ -20,7 +20,16 @@ TARGET := $(BIN_DIR)/GBAEmu
 
 .PHONY: all clean run directories
 
-all: directories $(TARGET)
+all: directories $(TARGET) test
+
+test: directories $(BUILD_DIR)/TestCPU
+	@echo "Running Tests..."
+	@$(BUILD_DIR)/TestCPU
+
+$(BUILD_DIR)/TestCPU: $(BUILD_DIR)/test/TestCPU.o $(OBJS)
+	@echo "Linking TestCPU"
+	@$(CXX) $(CXXFLAGS) -o $@ $(BUILD_DIR)/test/TestCPU.o $(filter $(BUILD_DIR)/core/%, $(OBJS))
+
 
 directories:
 	@mkdir -p $(BUILD_DIR)

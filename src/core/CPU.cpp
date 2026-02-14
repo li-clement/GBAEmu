@@ -55,6 +55,12 @@ void CPU::step() {
   // 计算当前指令的真实 PC 地址
   uint32_t currentPC =
       (cpsr & 0x20) ? (registers[15] - 4) : (registers[15] - 8);
+  if (currentPC >= 0x9D0 && currentPC <= 0x9E0) {
+    printf("%s PC=%08X Op=%08X R0=%08X R1=%08X CPSR=%08X\n",
+           (cpsr & 0x20) ? "Thumb" : "ARM", currentPC, opcode, registers[0],
+           registers[1], cpsr);
+  }
+
   if (Debugger::getInstance().isEnabled()) {
     Debugger::getInstance().logInstruction(currentPC, opcode, registers.data(),
                                            cpsr, (cpsr & 0x20));
@@ -1593,7 +1599,13 @@ void CPU::switchMode(uint32_t newMode) {
 }
 
 void CPU::irq() {
+  printf("CPU: IRQ Triggered! PC=%08X CPSR=%08X\n", registers[15], cpsr);
   uint32_t oldCPSR = cpsr;
+  // Adjust PC: logical PC is current instruction address.
+  // registers[15] is pipeline head.
+  // ARM: PC+8. We want PC+4. -> R15-4.
+  // Thumb: PC+4. We want PC+2/4?
+  // Standard formula used in other emus/docs:
   uint32_t oldPC = (cpsr & 0x20) ? registers[15] : registers[15] - 4;
 
   switchMode(0x12); // Switch to IRQ mode
@@ -1762,7 +1774,7 @@ void CPU::opSWI(uint32_t opcode) {
     swi = (opcode >> 16) & 0xFF;
   }
 
-  // printf("SWI Called: %02X PC=%08X\n", swi, registers[15]);
+  printf("SWI Called: %02X PC=%08X\n", swi, registers[15]);
 
   // HLE Implementation
   switch (swi) {
@@ -1794,7 +1806,10 @@ void CPU::opSWI(uint32_t opcode) {
   case 0x0C: // CpuFastSet
     hleCpuFastSet(registers[0], registers[1], registers[2]);
     return;
-    // TODO: Add LZ77 (0x11), BgAffineSet (0x0E), ObjAffineSet (0x0F)
+  case 0x11: // LZ77UnComp
+    hleLZ77UnComp(registers[0], registers[1]);
+    return;
+    // TODO: Add BgAffineSet (0x0E), ObjAffineSet (0x0F)
   }
 
   // Fallback to Real BIOS if not handled?
@@ -1980,10 +1995,10 @@ void CPU::opBlockDataTransfer(uint32_t opcode) {
   }
 
   // Write-back
-  // For Load, if Rn is in list... result unpredictable/implementation defined.
-  // Usually if Rn is not first, it's overwritten by load?
-  // GBA (ARM7TDMI) writeback if W=1.
-  // Exception: If L=1 and Rn is in list, W shouldn't be set?
+  // For Load, if Rn is in list... result unpredictable/implementation
+  // defined. Usually if Rn is not first, it's overwritten by load? GBA
+  // (ARM7TDMI) writeback if W=1. Exception: If L=1 and Rn is in list, W
+  // shouldn't be set?
   if (W && !(L && ((regList >> rn) & 1))) {
     if (U) {
       registers[rn] += distinctRegs * 4;
@@ -2121,8 +2136,6 @@ void Core::CPU::hleLZ77UnComp(uint32_t src, uint32_t dst) {
         // Disp = ((MSB<<8) | LSB) + 1
         // Length = (Count) + 3
 
-        // uint8_t b1 removed
-        // Just read bytes
         uint8_t byte1 = bus->read8(src++);
         uint8_t byte2 = bus->read8(src++);
 

@@ -1,5 +1,6 @@
 #include "Bus.h"
 #include "APU.h"
+#include "CPU.h"
 #include "Debugger.h"
 
 namespace Core {
@@ -123,6 +124,23 @@ void Bus::write8(uint32_t addr, uint8_t value) {
 }
 
 void Bus::write16(uint32_t addr, uint16_t value) {
+  // Write to IO
+  if ((addr >> 24) == 0x04) {
+    if (addr == 0x04000000) {
+      uint32_t pc = cpu ? cpu->getPC() : 0;
+      printf("Bus: Write DISPCNT = %04X at PC=%08X\n", value, pc);
+    } else if (addr == 0x04000004) {
+      uint32_t pc = cpu ? cpu->getPC() : 0;
+      printf("Bus: Write DISPSTAT = %04X at PC=%08X\n", value, pc);
+    }
+    // Mask out read-only bits or unimplemented IO?
+    // For now allow raw write.
+    // ...
+    // Note: Some IO regs are 8/16/32 specific.
+    // We are in write16.
+    *(uint16_t *)&io_regs[addr & 0x3FF] = value;
+    return;
+  }
   // 快速路径：IWRAM
   if ((addr >> 24) == 0x03) {
     *(uint16_t *)&wram_chip[addr & 0x7FFE] = value;
@@ -161,6 +179,6 @@ void Bus::setKeyInput(uint16_t value) {
   }
 }
 
-void Bus::setAPU(APU *apu) { this->apu = apu; }
+// setAPU moved to header inline
 
 } // namespace Core

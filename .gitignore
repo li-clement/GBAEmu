@@ -11,6 +11,8 @@ rom/
 *.dll
 *.bin
 *.gba
+*.log
+*.txt
 
 # Dependencies
 *.d
