@@ -1,0 +1,166 @@
+#include "Bus.h"
+#include "APU.h"
+#include "Debugger.h"
+
+namespace Core {
+
+Bus::Bus() {
+  bios.resize(16 * 1024);
+  wram_board.resize(256 * 1024);
+  wram_chip.resize(32 * 1024);
+  io_regs.resize(0x1000); // 扩展至覆盖 0x04000800 (WAITCNT) 等
+  // KEYINPUT (0x04000130) 初始化为 0x03FF (所有按键抬起)
+  io_regs[0x130] = 0xFF;
+  io_regs[0x131] = 0x03;
+  palette.resize(1024);
+  vram.resize(96 * 1024);
+  oam.resize(1024);
+  rom.resize(32 * 1024 * 1024); // Pre-allocate max size for simplicity
+}
+
+Bus::~Bus() {}
+
+void Bus::loadBIOS(const std::vector<uint8_t> &data) {
+  if (data.size() <= bios.size()) {
+    std::copy(data.begin(), data.end(), bios.begin());
+    vectorTableWritable_ = false; // 真实 BIOS 的向量表只读
+  }
+}
+
+void Bus::loadROM(const std::vector<uint8_t> &data) {
+  if (data.size() <= rom.size()) {
+    std::copy(data.begin(), data.end(), rom.begin());
+  }
+}
+
+uint8_t Bus::read8(uint32_t addr) {
+  // Simple memory map implementation
+  if (addr < 0x00004000) {
+    return bios[addr];
+  } else if (addr >= 0x02000000 && addr < 0x03000000) {
+    // 256KB On-board WRAM mirrored
+    return wram_board[(addr - 0x02000000) & 0x3FFFF];
+  } else if (addr >= 0x03000000 && addr < 0x04000000) {
+    // 32KB On-chip WRAM mirrored
+    return wram_chip[(addr - 0x03000000) & 0x7FFF];
+  } else if (addr >= 0x04000000 && addr < 0x04001000) {
+    return io_regs[addr - 0x04000000];
+  } else if (addr >= 0x05000000 && addr < 0x05000400) {
+    return palette[addr - 0x05000000];
+  } else if (addr >= 0x06000000 && addr < 0x06018000) {
+    return vram[addr - 0x06000000];
+  } else if (addr >= 0x07000000 && addr < 0x07000400) {
+    return oam[addr - 0x07000000];
+  } else if (addr >= 0x08000000) {
+    // ROM Mirroring handled simplistically
+    if (addr - 0x08000000 < rom.size())
+      return rom[addr - 0x08000000];
+  }
+
+  // Unmapped
+  Debugger::getInstance().logBusRead(addr, 0, 8);
+  return 0;
+}
+
+uint16_t Bus::read16(uint32_t addr) {
+  // 快速路径：BIOS 访问 (0x00xxxxxx)
+  if (addr < 0x3FFF) {
+    return *(uint16_t *)&bios[addr & ~1];
+  }
+  // 快速路径：IWRAM (0x03xxxxxx)
+  if ((addr >> 24) == 0x03) {
+    return *(uint16_t *)&wram_chip[addr & 0x7FFE];
+  }
+  // 快速路径：EWRAM (0x02xxxxxx)
+  if ((addr >> 24) == 0x02) {
+    return *(uint16_t *)&wram_board[addr & 0x3FFFE];
+  }
+  return read8(addr) | (read8(addr + 1) << 8);
+}
+
+uint32_t Bus::read32(uint32_t addr) {
+  // 快速路径：BIOS
+  if (addr < 0x3FFC) {
+    return *(uint32_t *)&bios[addr & ~3];
+  }
+  // 快速路径：IWRAM
+  if ((addr >> 24) == 0x03) {
+    return *(uint32_t *)&wram_chip[addr & 0x7FFC];
+  }
+  // 快速路径：EWRAM
+  if ((addr >> 24) == 0x02) {
+    return *(uint32_t *)&wram_board[addr & 0x3FFFC];
+  }
+  return read16(addr) | (read16(addr + 2) << 16);
+}
+
+void Bus::write8(uint32_t addr, uint8_t value) {
+  // 仅当未加载真实 BIOS 时允许写向量表 (0x00-0x3F)，供游戏安装 IRQ handler
+  if (addr < 0x40 && vectorTableWritable_) {
+    bios[addr] = value;
+    return;
+  }
+
+  if (addr >= 0x02000000 && addr < 0x03000000) {
+    // 256KB On-board WRAM mirrored
+    wram_board[(addr - 0x02000000) % 0x40000] = value;
+  } else if (addr >= 0x03000000 && addr < 0x04000000) {
+    // 32KB On-chip WRAM mirrored
+    wram_chip[(addr - 0x03000000) % 0x8000] = value;
+  } else if (addr >= 0x04000000 && addr < 0x04000400) {
+    uint32_t offset = addr - 0x04000000;
+    if (apu && offset >= 0x60 && offset <= 0xA8) {
+      apu->write8(addr, value);
+    }
+    io_regs[offset] = value;
+  } else if (addr >= 0x05000000 && addr < 0x05000400) {
+    palette[addr - 0x05000000] = value;
+  } else if (addr >= 0x06000000 && addr < 0x06018000) {
+    vram[addr - 0x06000000] = value;
+  } else if (addr >= 0x07000000 && addr < 0x07000400) {
+    oam[addr - 0x07000000] = value;
+  }
+}
+
+void Bus::write16(uint32_t addr, uint16_t value) {
+  // 快速路径：IWRAM
+  if ((addr >> 24) == 0x03) {
+    *(uint16_t *)&wram_chip[addr & 0x7FFE] = value;
+    return;
+  }
+  // 快速路径：EWRAM
+  if ((addr >> 24) == 0x02) {
+    *(uint16_t *)&wram_board[addr & 0x3FFFE] = value;
+    return;
+  }
+  write8(addr, value & 0xFF);
+  write8(addr + 1, (value >> 8) & 0xFF);
+}
+
+void Bus::write32(uint32_t addr, uint32_t value) {
+  // 快速路径：IWRAM
+  if ((addr >> 24) == 0x03) {
+    *(uint32_t *)&wram_chip[addr & 0x7FFC] = value;
+    return;
+  }
+  // 快速路径：EWRAM
+  if ((addr >> 24) == 0x02) {
+    *(uint32_t *)&wram_board[addr & 0x3FFFC] = value;
+    return;
+  }
+  write16(addr, value & 0xFFFF);
+  write16(addr + 2, (value >> 16) & 0xFFFF);
+}
+
+void Bus::setKeyInput(uint16_t value) {
+  // 0x4000130 - 0x04000000 = 0x130
+  uint32_t offset = 0x130;
+  if (offset < io_regs.size()) {
+    io_regs[offset] = value & 0xFF;
+    io_regs[offset + 1] = (value >> 8) & 0xFF;
+  }
+}
+
+void Bus::setAPU(APU *apu) { this->apu = apu; }
+
+} // namespace Core

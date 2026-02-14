@@ -1,0 +1,40 @@
+# Build directories
+build/
+bin/
+rom/
+
+# Object files and libraries
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.bin
+*.gba
+
+# Dependencies
+*.d
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor directories and files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Clang tooling
+compile_commands.json
+.cache/
+
+# ROM files (typically large binary files or copyrighted)
+*.gba
+rom/*.gba
