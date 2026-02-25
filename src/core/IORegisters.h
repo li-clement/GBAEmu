@@ -32,6 +32,7 @@ const uint16_t DISPCNT_BG1_ENABLE = 0x0200;
 const uint16_t DISPCNT_BG2_ENABLE = 0x0400;
 const uint16_t DISPCNT_BG3_ENABLE = 0x0800;
 const uint16_t DISPCNT_OBJ_ENABLE = 0x1000;
+const uint16_t DISPCNT_OBJ_1D_MAP = 0x0040;
 
 // Timers
 const uint32_t TM0CNT_L = 0x100;

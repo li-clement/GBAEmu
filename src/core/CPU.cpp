@@ -49,14 +49,87 @@ void CPU::setEntryPoint(uint32_t addr) {
 }
 
 void CPU::step() {
+  // CPU 被 SWI IntrWait/VBlankIntrWait 暂停时，跳过执行
+  if (halted)
+    return;
+
   // 当前要执行的指令永远在 pipeline[0]
   uint32_t opcode = pipeline[0];
 
   // 计算当前指令的真实 PC 地址
   uint32_t currentPC =
       (cpsr & 0x20) ? (registers[15] - 4) : (registers[15] - 8);
-  if (currentPC >= 0x9D0 && currentPC <= 0x9E0) {
-    printf("%s PC=%08X Op=%08X R0=%08X R1=%08X CPSR=%08X\n",
+  static bool traceActive = false;
+  static uint32_t lastPC = 0;
+
+  static uint64_t stepCount = 0;
+  if (stepCount++ % 2000000 == 0) {
+    fprintf(stderr, "CPU AT: PC=%08X CPSR=%08X Mode=%s stepCount=%llu\n",
+            currentPC, cpsr, (cpsr & 0x20) ? "Thumb" : "ARM", stepCount);
+  }
+
+  static uint32_t historyPC[256];
+  static uint32_t historyOp[256];
+  static uint32_t historySP[256];
+  static uint32_t historyLR[256];
+  static uint32_t historyR0[256];
+  static uint32_t historyR1[256];
+  static uint32_t historyR2[256];
+  static int historyIdx = 0;
+  historyPC[historyIdx] = currentPC;
+  historyOp[historyIdx] = opcode;
+  historySP[historyIdx] = registers[13];
+  historyLR[historyIdx] = registers[14];
+  historyR0[historyIdx] = registers[0];
+  historyR1[historyIdx] = registers[1];
+  historyR2[historyIdx] = registers[2];
+  historyIdx = (historyIdx + 1) % 256;
+
+  if (!traceActive && lastPC >= 0x08000000 && currentPC < 0x01000000) {
+    traceActive = true;
+    printf("JUMP TO BIOS DETECTED! Last PC=%08X, Current PC=%08X\n", lastPC,
+           currentPC);
+    printf("Instruction History before crash:\n");
+    for (int i = 0; i < 256; i++) {
+      int idx = (historyIdx + i) % 256;
+      printf(
+          "Hist[%d]: PC=%08X Op=%08X SP=%08X LR=%08X R0=%08X R1=%08X R2=%08X\n",
+          i, historyPC[idx], historyOp[idx], historySP[idx], historyLR[idx],
+          historyR0[idx], historyR1[idx], historyR2[idx]);
+    }
+  }
+
+  if (traceActive) {
+    static int traceCount = 0;
+    if (traceCount++ < 50) {
+      printf("BIOS TRACE %s PC=%08X Op=%08X R0=%08X R1=%08X CPSR=%08X\n",
+             (cpsr & 0x20) ? "Thumb" : "ARM", currentPC, opcode, registers[0],
+             registers[1], cpsr);
+    }
+  }
+  lastPC = currentPC;
+
+  static uint64_t totalInsns = 0;
+  totalInsns++;
+  if (totalInsns % 1000000 == 0) {
+    printf("CPU Heartbeat: %s PC=%08X CPSR=%08X Op=%08X\n",
+           (cpsr & 0x20) ? "Thumb" : "ARM", currentPC, cpsr, opcode);
+  }
+
+  if (currentPC >= 0x07000000 && currentPC < 0x08000000) {
+    static int weirdPcLogCount = 0;
+    if (weirdPcLogCount++ < 100) {
+      printf("WEIRD PC %08X Op=%08X R0=%08X R1=%08X CPSR=%08X\n", currentPC,
+             opcode, registers[0], registers[1], cpsr);
+    }
+  }
+
+  static int romBootTrace = 0;
+  if (currentPC == 0x08000000)
+    romBootTrace = 50;
+  if (romBootTrace > 0) {
+    romBootTrace--;
+    printf("BOOT TRACE: %s PC=%08X Op=%08X R0=%08X R1=%08X CPSR=%08X\n",
            (cpsr & 0x20) ? "Thumb" : "ARM", currentPC, opcode, registers[0],
            registers[1], cpsr);
   }
@@ -693,8 +766,10 @@ void CPU::executeThumb(uint16_t opcode) {
     switch (op) {
     case 0: // ADD
       registers[rd] += registers[rs];
-      // Instructions involving Hi regs don't usually update flags?
-      // "If a Hi-Register operand is used... flags NOT updated" (except CMP?)
+      if (rd == 15) {
+        registers[15] &= ~1;
+        reloadPipeline();
+      }
       break;
     case 1: // CMP
       // Always updates flags?
@@ -713,6 +788,10 @@ void CPU::executeThumb(uint16_t opcode) {
       break;
     case 2: // MOV
       registers[rd] = registers[rs];
+      if (rd == 15) {
+        registers[15] &= ~1;
+        reloadPipeline();
+      }
       break;
     case 3: // BX
     {
@@ -771,94 +850,40 @@ void CPU::executeThumb(uint16_t opcode) {
     return;
   }
 
-  // Format 7: Load/Store with Register Offset
-  // 0101 00L B xxxx xxxx
-  if ((opcode >> 10) == 0x14) {
-    bool L = (opcode >> 11) & 1;
-    bool B = (opcode >> 10) & 1;
-    uint8_t ro = (opcode >> 6) & 0x7;
-    uint8_t rb = (opcode >> 3) & 0x7;
-    uint8_t rd = opcode & 0x7;
-
-    uint32_t addr = registers[rb] + registers[ro];
-
-    if (L) {
-      if (B) { // LDRB
-        registers[rd] = bus->read8(addr);
-      } else { // LDR
-        uint32_t val = bus->read32(addr);
-        // Rotate if unaligned?
-        // "In Thumb state, LDR... instructions are not supported on unaligned
-        // addresses" But hardware might rotate. Let's assume standard read32
-        // does simple read.
-        registers[rd] = val;
-      }
-    } else {
-      if (B) { // STRB
-        bus->write8(addr, registers[rd] & 0xFF);
-      } else { // STR
-        bus->write32(addr, registers[rd]);
-      }
-    }
-    return;
-  }
-
-  // Format 7b: Load/Store with Register Offset (encoding 0101 10xx)
-  // 0101 10 L B Ro Rb Rd -> 00 STRH 01 LDSB 10 LDRH 11 LDR
-  if ((opcode >> 10) == 0x16) {
-    uint8_t op = ((opcode >> 11) & 1) << 1 | ((opcode >> 10) & 1);
+  // Format 7 & 8: Load/Store with Register Offset
+  // 0101 xxx Ro Rb Rd
+  if ((opcode >> 12) == 0x5) {
+    uint8_t op = (opcode >> 9) & 0x7;
     uint8_t ro = (opcode >> 6) & 0x7;
     uint8_t rb = (opcode >> 3) & 0x7;
     uint8_t rd = opcode & 0x7;
     uint32_t addr = registers[rb] + registers[ro];
+
     switch (op) {
-    case 0: // STRH
+    case 0: // STR
+      bus->write32(addr, registers[rd]);
+      break;
+    case 1: // STRH
       bus->write16(addr, registers[rd] & 0xFFFF);
       break;
-    case 1: // LDSB
+    case 2: // STRB
+      bus->write8(addr, registers[rd] & 0xFF);
+      break;
+    case 3: // LDSB
       registers[rd] = (int32_t)(int8_t)bus->read8(addr);
       break;
-    case 2: // LDRH
-      registers[rd] = bus->read16(addr);
-      break;
-    case 3: // LDR (register offset)
+    case 4: // LDR
       registers[rd] = bus->read32(addr);
       break;
-    }
-    return;
-  }
-
-  // Format 8: Load/Store Sign-Extended Byte/Halfword — 0101 01xx (0x28–0x2B)
-  if ((opcode >> 9) >= 0x28 && (opcode >> 9) <= 0x2B) {
-    bool H = (opcode >> 11) & 1; // Bit 11 is H? No format is H/S/Ro/Rb/Rd
-    // Format 8 details: 0101 01 H S Rb Ro Rd
-    // H=0, S=0: STRH (Store Halfword) -> Bit 11=0, Bit 10=0? No Format 8 is
-    // special. Bits 11-10 determine op: 00: STRH 01: LDSB 10: LDRH 11: LDSH
-
-    uint8_t op = (opcode >> 10) & 0x3;
-    uint8_t ro = (opcode >> 6) & 0x7;
-    uint8_t rb = (opcode >> 3) & 0x7;
-    uint8_t rd = opcode & 0x7;
-
-    uint32_t addr = registers[rb] + registers[ro];
-
-    switch (op) {
-    case 0: // STRH
-      bus->write16(addr, registers[rd] & 0xFFFF);
-      break;
-    case 1: // LDSB
-    {
-      int8_t val = (int8_t)bus->read8(addr);
-      registers[rd] = (int32_t)val;
-    } break;
-    case 2: // LDRH
+    case 5: // LDRH
       registers[rd] = bus->read16(addr);
       break;
-    case 3: // LDSH
-    {
-      int16_t val = (int16_t)bus->read16(addr);
-      registers[rd] = (int32_t)val;
-    } break;
+    case 6: // LDRB
+      registers[rd] = bus->read8(addr);
+      break;
+    case 7: // LDSH
+      registers[rd] = (int32_t)(int16_t)bus->read16(addr);
+      break;
     }
     return;
   }
@@ -959,36 +984,6 @@ void CPU::executeThumb(uint16_t opcode) {
     } else {
       registers[13] += val;
     }
-    return;
-  }
-
-  // STMIA Rn!, Rlist (encoding 1011 10 0 Rn Rlist)
-  if ((opcode >> 11) == 0x16) {
-    uint8_t rn = (opcode >> 8) & 0x7;
-    uint8_t rlist = opcode & 0xFF;
-    uint32_t addr = registers[rn];
-    for (int i = 0; i < 8; i++) {
-      if ((rlist >> i) & 1) {
-        bus->write32(addr, registers[i]);
-        addr += 4;
-      }
-    }
-    registers[rn] = addr;
-    return;
-  }
-
-  // LDMIA Rn!, Rlist (encoding 1011 10 1 Rn Rlist)
-  if ((opcode >> 11) == 0x17) {
-    uint8_t rn = (opcode >> 8) & 0x7;
-    uint8_t rlist = opcode & 0xFF;
-    uint32_t addr = registers[rn];
-    for (int i = 0; i < 8; i++) {
-      if ((rlist >> i) & 1) {
-        registers[i] = bus->read32(addr);
-        addr += 4;
-      }
-    }
-    registers[rn] = addr;
     return;
   }
 
@@ -1413,10 +1408,12 @@ void CPU::opDataProcessing(uint32_t opcode) {
     registers[rd] = res;
   }
 
-  // 写 R15 且 S=1：从异常返回，恢复 CPSR 并刷新流水线
+  // 写 R15 且 S=1：从异常返回，完整恢复 CPSR 并刷新流水线
   if (rd == 15) {
     if (S) {
-      switchMode(spsr & 0x1F);
+      uint32_t saved_spsr = spsr;
+      switchMode(saved_spsr & 0x1F);
+      cpsr = saved_spsr; // 使用保存的 spsr，防止 switchMode 覆盖它
     }
     reloadPipeline();
   }
@@ -1599,7 +1596,8 @@ void CPU::switchMode(uint32_t newMode) {
 }
 
 void CPU::irq() {
-  printf("CPU: IRQ Triggered! PC=%08X CPSR=%08X\n", registers[15], cpsr);
+  // IRQ 唤醒 halted 状态的 CPU
+  halted = false;
   uint32_t oldCPSR = cpsr;
   // Adjust PC: logical PC is current instruction address.
   // registers[15] is pipeline head.
@@ -1776,19 +1774,47 @@ void CPU::opSWI(uint32_t opcode) {
 
   printf("SWI Called: %02X PC=%08X\n", swi, registers[15]);
 
-  // HLE Implementation
+  // 有真实 BIOS 时，走硬件 SWI 路径（跳转到 0x08 执行 BIOS 代码）
+  if (hasBIOS_) {
+    uint32_t oldCPSR = cpsr;
+    uint32_t oldPC = (cpsr & 0x20) ? (registers[15] - 2) : (registers[15] - 4);
+
+    switchMode(0x13); // Supervisor mode
+
+    spsr = oldCPSR;
+    registers[14] = oldPC;
+    cpsr &= ~0x20; // ARM mode
+    cpsr |= 0x80;  // I=1
+
+    registers[15] = 0x08;
+    reloadPipeline();
+    return;
+  }
+
+  // HLE Implementation (无 BIOS 时)
   switch (swi) {
   case 0x01: // RegisterRamReset
-    // Reset IO registers/RAM/Palette based on R0
-    // Simplified: Do nothing or clear some state?
-    // Castlevania might rely on this clearing video memory?
     return;
-  case 0x04: // IntrWait (Checks for Intr, WaitOne)
   case 0x05: // VBlankIntrWait
-    // Stub: Just return immediately. Game will continue.
-    // Ideally we should halt until interrupt.
-    // But returning is 'safe' (CPU just spins or continues).
+  {
+    // 清除 IntrWait flags 中的 VBlank 位
+    uint16_t flags = bus->read16(0x03007FF8);
+    bus->write16(0x03007FF8, flags & ~0x1);
+    // 设置 halted，等待 VBlank 中断唤醒
+    halted = true;
     return;
+  }
+  case 0x04: // IntrWait
+  {
+    // R0: 1 = 丢弃旧标志, 0 = 检查已有标志
+    // R1: 要等待的中断掩码
+    if (registers[0]) {
+      uint16_t flags = bus->read16(0x03007FF8);
+      bus->write16(0x03007FF8, flags & ~(uint16_t)registers[1]);
+    }
+    halted = true;
+    return;
+  }
   case 0x06: // Div
   {
     int32_t num = (int32_t)registers[0];
@@ -1809,30 +1835,11 @@ void CPU::opSWI(uint32_t opcode) {
   case 0x11: // LZ77UnComp
     hleLZ77UnComp(registers[0], registers[1]);
     return;
-    // TODO: Add BgAffineSet (0x0E), ObjAffineSet (0x0F)
-  }
+  } // end switch
 
-  // Fallback to Real BIOS if not handled?
-  // If HLE Boot is on, Real BIOS is broken/uninitialized.
-  // So we SHOULD NOT fall back.
-  // Just log unknown SWI.
-  // printf("Unhandled SWI %02X at %08X\n", swi, registers[15]);
-  // return;
-
-  /*
-  uint32_t oldCPSR = cpsr;
-  uint32_t oldPC = (cpsr & 0x20) ? (registers[15] - 2) : (registers[15] - 4);
-
-  switchMode(0x13); // Supervisor mode
-
-  spsr = oldCPSR;
-  registers[14] = oldPC;
-  cpsr &= ~0x20; // ARM mode
-  cpsr |= 0x80;  // I=1
-
-  registers[15] = 0x08;
-  reloadPipeline();
-  */
+  // Log unhandled SWI and return immediately instead of crashing into BIOS
+  printf("Unhandled SWI %02X at %08X, ignoring...\n", swi, registers[15]);
+  return;
 }
 
 void CPU::opMRS(uint32_t opcode) {
@@ -2011,8 +2018,9 @@ void CPU::opBlockDataTransfer(uint32_t opcode) {
   if (S) {
     if (L && ((regList >> 15) & 1)) {
       // LDM with PC -> Restore CPSR from SPSR
-      switchMode(spsr & 0x1F);
-      cpsr = spsr;
+      uint32_t saved_spsr = spsr;
+      switchMode(saved_spsr & 0x1F);
+      cpsr = saved_spsr; // 使用保存的 spsr，防止 switchMode 覆盖它
     } else {
       // User Bank Transfer (Not fully implemented, requires banked registers)
     }
@@ -2030,67 +2038,51 @@ void CPU::opBlockDataTransfer(uint32_t opcode) {
 
 // HLE Implementations
 void Core::CPU::hleCpuSet(uint32_t src, uint32_t dst, uint32_t control) {
-  // Control:
-  // Bit 0-20: Word Count
-  // Bit 24: Fixed Source Address (mode)
-  // Bit 26: 32-bit (1) / 16-bit (0)
-
   int count = control & 0x1FFFFF;
   bool fixedSrc = (control >> 24) & 1;
   bool is32 = (control >> 26) & 1;
 
-  if (is32) {
-    uint32_t val = 0;
-    if (fixedSrc)
-      val = bus->read32(src);
+  if (count == 0)
+    return;
 
+  if (is32) {
+    uint32_t val = bus->read32(src);
     for (int i = 0; i < count; i++) {
-      if (!fixedSrc) {
-        val = bus->read32(src);
-        src += 4;
-      }
       bus->write32(dst, val);
       dst += 4;
+      if (!fixedSrc) {
+        src += 4;
+        val = bus->read32(src);
+      }
     }
   } else {
-    uint16_t val = 0;
-    if (fixedSrc)
-      val = bus->read16(src);
-
+    uint16_t val = bus->read16(src);
     for (int i = 0; i < count; i++) {
-      if (!fixedSrc) {
-        val = bus->read16(src);
-        src += 2;
-      }
       bus->write16(dst, val);
       dst += 2;
+      if (!fixedSrc) {
+        src += 2;
+        val = bus->read16(src);
+      }
     }
   }
 }
 
 void Core::CPU::hleCpuFastSet(uint32_t src, uint32_t dst, uint32_t control) {
-  // Always 32-bit. Count is in Words.
-  // Must be multiple of 8 words.
-  // Control:
-  // Bit 0-20: Word Count
-  // Bit 24: Fixed Source
-
   int count = control & 0x1FFFFF;
   bool fixedSrc = (control >> 24) & 1;
 
-  // Simplification: Not enforcing 8-word chunks strictness, just copying.
+  if (count == 0)
+    return;
 
-  uint32_t val = 0;
-  if (fixedSrc)
-    val = bus->read32(src);
-
+  uint32_t val = bus->read32(src);
   for (int i = 0; i < count; i++) {
-    if (!fixedSrc) {
-      val = bus->read32(src);
-      src += 4;
-    }
     bus->write32(dst, val);
     dst += 4;
+    if (!fixedSrc) {
+      src += 4;
+      val = bus->read32(src);
+    }
   }
 }
 

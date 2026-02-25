@@ -176,18 +176,30 @@ void GBA::stepFrame(uint32_t *buffer, size_t stride) {
       }
     }
 
-    // Check for ROM entry (Moved logging to trace logic potentially?)
+    // Check for ROM entry
     static bool romEntered = false;
     if (!romEntered && cpu->getPC() >= 0x08000000) {
       romEntered = true;
       printf("GBAEmu: JUMP TO ROM CONFIRMED! PC=0x%08X\n", cpu->getPC());
     }
-    // Duplicate renderScanline removed from here
+
+    static int palDumpCount = 0;
+    if (line == 159 && palDumpCount++ % 60 == 0) {
+      printf("PALETTE DUMP (Frame %d): ", palDumpCount / 60);
+      for (int i = 0; i < 16; i++) {
+        printf("%04X ", bus->read16(0x05000000 + i * 2));
+      }
+      printf("\n");
+      printf("VRAM DUMP BG: ");
+      for (int i = 0; i < 8; i++) {
+        printf("%04X ", bus->read16(0x06000000 + i * 2));
+      }
+      printf("\n");
+    }
 
     // VBlank 开始时触发 VBlank IRQ 和 DMA
     if (line == VISIBLE_LINES) {
       uint16_t dstat = bus->read16(0x04000004);
-      printf("GBA: VBlank Start. DISPSTAT=%04X\n", dstat);
       if (dstat & 0x8) {
         requestInterrupt(0x1); // VBlank IRQ
       }
@@ -202,7 +214,7 @@ void GBA::stepFrame(uint32_t *buffer, size_t stride) {
       }
     }
   }
-  Debugger::getInstance().flush();
+  // Debugger::getInstance().flush();
 }
 
 void GBA::setKeyStatus(uint16_t keyMask, bool pressed) {
@@ -224,38 +236,35 @@ void GBA::setKeyStatus(uint16_t keyMask, bool pressed) {
   bus->write16(addr, current);
 }
 
+void GBA::latchDMA(int c) {
+  uint32_t regBase = 0x04000000 + 0xB0 + (c * 0xC);
+  uint16_t cnt_h = bus->read16(regBase + 0xA);
+
+  if ((cnt_h & 0x8000) && !dma[c].active) {
+    dma[c].active = true;
+    dma[c].sad = bus->read32(regBase);
+    dma[c].dad = bus->read32(regBase + 4);
+    dma[c].count = bus->read16(regBase + 8);
+  } else if (!(cnt_h & 0x8000)) {
+    dma[c].active = false;
+  }
+}
+
 void GBA::checkDMA() {
   // Check all 4 channels
   for (int i = 0; i < 4; i++) {
-    // Read Control Register High (Enable bit 15)
-    // DMA0CNT_H is 0xBA, etc.
-    // Base: 0x040000B0 + i*12 + 10 (offset to CNT_H)
-    // Actually we should store state in `dma` struct when registers are
-    // written, but for now, let's just read from Bus or assume registers
-    // are updated. Wait, GBA class doesn't trap IO writes instantly unless
-    // we hook Bus. Let's rely on polling for this step or reading from Bus
-    // IORegs.
+    latchDMA(i);
+
+    if (!dma[i].active)
+      continue; // Not enabled
 
     uint32_t regBase = 0x04000000 + 0xB0 + (i * 0xC);
     uint16_t cnt_h = bus->read16(regBase + 0xA);
 
-    if (!(cnt_h & 0x8000))
-      continue; // Not enabled
-
     // Timing Mode (Bits 12-13)
-    // 00 = Immediate
-    // 01 = VBlank
-    // 10 = HBlank
-    // 11 = Special
     int timing = (cnt_h >> 12) & 0x3;
 
-    bool trigger = false;
-    if (timing == 0)
-      trigger = true; // Immediate - should have happened on write, but
-                      // polling works for test
-    // TODO: Add VBlank/HBlank triggers
-
-    if (trigger) {
+    if (timing == 0) { // Immediate
       transferDMA(i);
     }
   }
@@ -264,22 +273,60 @@ void GBA::checkDMA() {
 void GBA::transferDMA(int channel) {
   uint32_t regBase = 0x04000000 + 0xB0 + (channel * 0xC);
 
-  // Read Registers
-  uint32_t sad = bus->read32(regBase);
-  uint32_t dad = bus->read32(regBase + 4);
-  uint16_t cnt_l = bus->read16(regBase + 8);
+  // Read internal state
+  uint32_t sad = dma[channel].sad;
+  uint32_t dad = dma[channel].dad;
   uint16_t cnt_h = bus->read16(regBase + 0xA);
 
-  int count = cnt_l;
+  int count = dma[channel].count;
   if (count == 0)
     count = (channel == 3) ? 0x10000 : 0x4000;
 
-  int width = (cnt_h & 0x0400) ? 4 : 2; // 32-bit or 16-bit
-  int srcAdj = (cnt_h >> 7) & 0x3; // 0=Inc, 1=Dec, 2=Fixed, 3=Inc prohibited?
-  int dstAdj = (cnt_h >> 5) & 0x3; // 0=Inc, 1=Dec, 2=Fixed, 3=Reload
+  int run_count = count;
+  int timing = (cnt_h >> 12) & 0x3;
+
+  // Sound DMA（timing=3, channel 1/2）：固定传输 4 个 word
+  bool isSoundDMA = (timing == 3 && (channel == 1 || channel == 2));
+  if (isSoundDMA) {
+    run_count = 4;
+    dma[channel].count -= 4;
+    if (dma[channel].count < 0)
+      dma[channel].count = 0;
+  } else {
+    dma[channel].count = 0;
+  }
+
+  int width = (cnt_h & 0x0400) ? 4 : 2;
+  int srcAdj = (cnt_h >> 7) & 0x3;
+  int dstAdj = (cnt_h >> 5) & 0x3;
+
+  // Sound DMA 强制：32-bit 传输，目标地址固定（FIFO 地址不变）
+  if (isSoundDMA) {
+    width = 4;
+    dstAdj = 2; // Fixed
+  }
+
+  // DEBUG SOUND DMA
+  if (dad == 0x040000A0 || dad == 0x040000A4) {
+    static int soundDmaLog = 0;
+    if (soundDmaLog++ < 100) {
+      if (soundDmaLog % 10 == 0)
+        printf("SOUND DMA: channel=%d timing=%d sad=%08X dad=%08X count=%d "
+               "width=%d\n",
+               channel, timing, sad, dad, dma[channel].count, width);
+    }
+  }
+
+  static int dmaLog = 0;
+  if (dad == 0x05000000 && dmaLog++ < 5) {
+    printf("DMA%d PALETTE: SAD=%08X DAD=%08X CNT=%d WIDTH=%d SRCADJ=%d\n",
+           channel, sad, dad, count, width, srcAdj);
+    printf("ROM AT SAD: %04X %04X %04X %04X\n", bus->read16(sad),
+           bus->read16(sad + 2), bus->read16(sad + 4), bus->read16(sad + 6));
+  }
 
   // Perform Transfer
-  for (int n = 0; n < count; n++) {
+  for (int n = 0; n < run_count; n++) {
     if (width == 4) {
       uint32_t val = bus->read32(sad);
       bus->write32(dad, val);
@@ -293,21 +340,35 @@ void GBA::transferDMA(int channel) {
       sad += width;
     else if (srcAdj == 1)
       sad -= width;
-    // Fixed (2) does nothing
 
     if (dstAdj == 0)
       dad += width;
     else if (dstAdj == 1)
       dad -= width;
-    // Fixed (2) does nothing
+    // dstAdj == 3 applies at the end of full transfer
   }
 
-  // Disable if not repeat (Repeat Bit 9)
-  // Most transfers clear Enable bit upon completion unless Repeat is set
-  // (for Vblank/Hblank/etc) Immediate always clears.
-  if (!((cnt_h >> 9) & 1) || ((cnt_h >> 12) & 3) == 0) {
-    // Clear Enable bit
-    bus->write16(regBase + 0xA, cnt_h & ~0x8000);
+  // Save back internal state to support repeat
+  dma[channel].sad = sad;
+  dma[channel].dad = dad;
+
+  if (dma[channel].count == 0) {
+    if (cnt_h & 0x4000) {                  // IRQ Enable
+      requestInterrupt(0x0100 << channel); // DMA0-3 IRQ uses bits 8-11
+    }
+
+    if (cnt_h & 0x0200) { // Repeat
+      dma[channel].count = bus->read16(regBase + 8);
+      // Sound DMA 或 dstAdj==3 时重载目标地址
+      if (dstAdj == 3 || isSoundDMA) {
+        dma[channel].dad = bus->read32(regBase + 4);
+      }
+    } else {
+      // Disable DMA
+      cnt_h &= ~0x8000;
+      bus->write16(regBase + 0xA, cnt_h);
+      dma[channel].active = false;
+    }
   }
 }
 
@@ -369,15 +430,98 @@ void GBA::loadROM(const std::vector<uint8_t> &data) {
     return;
   }
   bus->loadROM(data);
-  // 无 BIOS 时安装最小 IRQ 向量，使游戏能响应 VBlank 等中断
+  // 无 BIOS 时安装完整的 HLE IRQ handler
   if (!hasBIOS) {
-    bus->write32(0x18, 0xE59FF000u); // LDR PC, [PC, #-4]
-    bus->write32(0x1C, 0x00000020u); // 默认跳转到 0x20
-    bus->write32(0x20, 0xE25EF004u); // SUBS PC, R14, #4  (return from IRQ)
+    cpu->setHasBIOS(false);
+
+    // === IRQ Vector (0x18): B 0x120 ===
+    // offset = (0x120 - 0x20) / 4 = 0x40
+    bus->write32(0x18, 0xEA000040u);
+
+    // === 完整 HLE BIOS IRQ Handler (0x120 - 0x188) ===
+    // 保存寄存器到 IRQ 栈
+    bus->write32(0x120, 0xE92D500Fu); // STMFD SP!, {R0-R3, R12, LR}
+    // 构造 IO 基地址 0x04000200
+    bus->write32(0x124, 0xE3A00404u); // MOV R0, #0x04000000
+    bus->write32(0x128, 0xE2800C02u); // ADD R0, R0, #0x200
+    // 读 IE|IF (32位: low=IE, high=IF)
+    bus->write32(0x12C, 0xE5901000u); // LDR R1, [R0]
+    // R2 = IE & IF
+    bus->write32(0x130, 0xE0012821u); // AND R2, R1, R1, LSR #16
+    // 确认 IF（写1清除）
+    bus->write32(0x134, 0xE1C020B2u); // STRH R2, [R0, #2]
+    // 构造 0x03007FF8 (IntrWait flags 地址)
+    bus->write32(0x138, 0xE3A03403u); // MOV R3, #0x03000000
+    bus->write32(0x13C, 0xE2833C7Fu); // ADD R3, R3, #0x7F00
+    bus->write32(0x140, 0xE28330F8u); // ADD R3, R3, #0xF8
+    // 更新 IntrWait flags
+    bus->write32(0x144, 0xE593C000u); // LDR R12, [R3]
+    bus->write32(0x148, 0xE18CC002u); // ORR R12, R12, R2
+    bus->write32(0x14C, 0xE583C000u); // STR R12, [R3]
+    // 读游戏 IRQ handler 地址 [0x03007FFC]
+    bus->write32(0x150, 0xE593C004u); // LDR R12, [R3, #4]
+    // 切换到 System 模式 (mode=0x1F, 保持 I=1)
+    bus->write32(0x154, 0xE10F0000u); // MRS R0, CPSR
+    bus->write32(0x158, 0xE3C0001Fu); // BIC R0, R0, #0x1F
+    bus->write32(0x15C, 0xE380001Fu); // ORR R0, R0, #0x1F
+    bus->write32(0x160, 0xE121F000u); // MSR CPSR_c, R0
+    // 保存 LR 到 System 栈
+    bus->write32(0x164, 0xE92D4000u); // STMFD SP!, {LR}
+    // 调用游戏 handler: MOV LR, PC 使 LR=0x170; BX R12 跳转
+    bus->write32(0x168, 0xE1A0E00Fu); // MOV LR, PC  (LR = 0x170)
+    bus->write32(0x16C, 0xE12FFF1Cu); // BX R12
+    // === 游戏 handler 返回到这里 (0x170) ===
+    bus->write32(0x170, 0xE8BD4000u); // LDMFD SP!, {LR}
+    // 切回 IRQ 模式 (mode=0x12 | I=0x80 = 0x92)
+    bus->write32(0x174, 0xE10F0000u); // MRS R0, CPSR
+    bus->write32(0x178, 0xE3C0001Fu); // BIC R0, R0, #0x1F
+    bus->write32(0x17C, 0xE3800092u); // ORR R0, R0, #0x92
+    bus->write32(0x180, 0xE121F000u); // MSR CPSR_c, R0
+    // 恢复寄存器
+    bus->write32(0x184, 0xE8BD500Fu); // LDMFD SP!, {R0-R3, R12, LR}
+    // 从 IRQ 返回 (恢复 CPSR 从 SPSR)
+    bus->write32(0x188, 0xE25EF004u); // SUBS PC, LR, #4
+
+    // 锁定 BIOS 区域，防止游戏覆盖 IRQ 向量（真实 GBA 上 BIOS ROM 是只读的）
+    bus->lockBIOSVectorTable();
+
+    printf("GBAEmu: Installed HLE BIOS IRQ handler at 0x120-0x188\n");
+  } else {
+    cpu->setHasBIOS(true);
   }
 }
 
 void GBA::updateTimers(int cycles) {
+  auto checkSoundDMA = [&](int timerId) {
+    for (int c = 1; c <= 2; c++) {
+      if (!dma[c].active)
+        continue;
+      uint32_t regBase = 0x04000000 + 0xB0 + (c * 0xC);
+      uint16_t cnt_h = bus->read16(regBase + 0xA);
+      if (((cnt_h >> 12) & 0x3) == 3) {
+        if (dma[c].dad == 0x040000A0 && apu->timerForFifoA() == timerId) {
+          if (apu->fifoA_count() <= 16)
+            transferDMA(c);
+        } else if (dma[c].dad == 0x040000A4 &&
+                   apu->timerForFifoB() == timerId) {
+          if (apu->fifoB_count() <= 16)
+            transferDMA(c);
+        }
+      }
+    }
+  };
+
+  static int logTimerDmaStatus = 0;
+  if (logTimerDmaStatus++ % 10000 == 0) {
+    if (dma[1].active || dma[2].active) {
+      printf("TIMER STATUS: DMA1 Active=%d Dad=%08X  DMA2 Active=%d Dad=%08X  "
+             "FifoA cnt=%d (T%d) FifoB cnt=%d (T%d)\n",
+             dma[1].active, dma[1].dad, dma[2].active, dma[2].dad,
+             apu->fifoA_count(), apu->timerForFifoA(), apu->fifoB_count(),
+             apu->timerForFifoB());
+    }
+  }
+
   // Basic Timer Implementation
   for (int i = 0; i < 4; i++) {
     uint32_t cnt_h_addr = 0x04000102 + (i * 4);
@@ -417,25 +561,20 @@ void GBA::updateTimers(int cycles) {
         timers[i].cycles -= threshold;
 
         uint32_t cnt_l_addr = 0x04000100 + (i * 4);
-        uint16_t val = bus->read16(cnt_l_addr);
-        val++;
-        bus->write16(cnt_l_addr, val);
+        timers[i].counter++;
 
-        if (val == 0) { // Overflow
-                        // Reload (Latch)
-                        // We need to fetch the reload value.
-          // Since we don't have separate storage for reload in Bus,
-          // and we can't easily intercept the write to store it in
-          // 'timers[i].reload' without Bus modification, we will assume for
-          // now that standard practice is to write reload to TMxCNT_L. But
-          // wait, if we write to it, we update the counter. The GBA has an
-          // internal Reload latch. When we write to TMxCNT_L, it sets the
-          // Reload Latch (and the Counter?). Let's rely on our
-          // 'timers[i].reload' which we likely haven't set yet! Fix: We
-          // need to capture writes to TMxCNT_L.
+        if (timers[i].counter == 0) { // Overflow
+          // Read the reload latch directly from the bus (where game writes it)
+          timers[i].counter = bus->read16(cnt_l_addr);
 
-          // For now, let's just reload with 0 to keep it running.
-          bus->write16(cnt_l_addr, timers[i].reload);
+          static int timerOverflowLog = 0;
+          if (timerOverflowLog++ % 44000 == 0)
+            printf("TIMER OVERFLOW: Timer %d, Reload Latch = %04X\n", i,
+                   timers[i].counter);
+
+          // DirectSound FIFO Pop
+          apu->onTimerOverflow(i);
+          checkSoundDMA(i);
 
           if (control & 0x40) { // IRQ Enable
             uint16_t irqMask = 0;
@@ -461,6 +600,8 @@ void GBA::updateTimers(int cycles) {
               bus->write16(next_cnt_addr, next_val);
               if (next_val == 0) {
                 bus->write16(next_cnt_addr, timers[i + 1].reload);
+                apu->onTimerOverflow(i + 1);
+                checkSoundDMA(i + 1);
                 if (next_ctrl & 0x40) {
                   uint16_t flag =
                       (i + 1 == 1) ? 0x10 : (i + 1 == 2 ? 0x20 : 0x40);
@@ -476,9 +617,8 @@ void GBA::updateTimers(int cycles) {
 }
 
 void GBA::requestInterrupt(int id) {
-  uint16_t if_reg = bus->read16(0x04000202);
-  bus->write16(0x04000202, if_reg | id);
-  printf("GBA: Request Interrupt ID=%X IF=%04X\n", id, if_reg | id);
+  bus->requestInterrupt(id);
+  // printf("GBA: Request Interrupt ID=%X IF=%04X\n", id, if_reg | id);
   checkInterrupts();
 }
 
@@ -487,10 +627,10 @@ void GBA::checkInterrupts() {
   uint16_t if_reg = bus->read16(0x04000202);
   uint16_t ime = bus->read16(0x04000208);
 
-  // Throttle printing IME check or only print if IME=1?
-  if (ime & 1) {
+  // Prevent infinite recursive interrupting
+  if ((ime & 1) && cpu->isIRQEnabled()) {
     if (ie & if_reg) {
-      printf("GBA: Firing CPU IRQ! IE&IF=%04X\n", ie & if_reg);
+      // printf("GBA: Firing CPU IRQ! IE&IF=%04X\n", ie & if_reg);
       cpu->irq();
     } else {
       // IME is on but no matching interrupt

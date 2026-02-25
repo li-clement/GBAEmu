@@ -13,6 +13,12 @@ void APU::reset() {
   sound1cnt_h = 0;
   sound1cnt_x = 0;
 
+  soundcnt_l = 0;
+  soundcnt_h = 0;
+  soundcnt_x = 0;
+  fifoA.reset();
+  fifoB.reset();
+
   square1.enabled = false;
   square1.lengthCounter = 0;
   square1.envelopeVolume = 0;
@@ -94,6 +100,42 @@ void APU::getSamples(int16_t *left, int16_t *right) {
 
   *left = sample;
   *right = sample;
+
+  // Mix DirectSound (FIFO A and B)
+  int dsA = fifoA.lastSample;
+  int dsB = fifoB.lastSample;
+
+  int dsAVol = (soundcnt_h & 0x0004) ? 100 : 50; // Bit 2
+  int dsBVol = (soundcnt_h & 0x0008) ? 100 : 50; // Bit 3
+
+  dsA = (dsA * dsAVol) / 100;
+  dsB = (dsB * dsBVol) / 100;
+
+  int dsLeft = 0;
+  int dsRight = 0;
+
+  if (soundcnt_h & 0x0100)
+    dsRight += dsA; // Bit 8
+  if (soundcnt_h & 0x0200)
+    dsLeft += dsA; // Bit 9
+  if (soundcnt_h & 0x1000)
+    dsRight += dsB; // Bit 12
+  if (soundcnt_h & 0x2000)
+    dsLeft += dsB; // Bit 13
+
+  // Arbitrary scaling for 16-bit audio output
+  int outL = *left + dsLeft * 64;
+  int outR = *right + dsRight * 64;
+  if (outL < -32768)
+    outL = -32768;
+  else if (outL > 32767)
+    outL = 32767;
+  if (outR < -32768)
+    outR = -32768;
+  else if (outR > 32767)
+    outR = 32767;
+  *left = outL;
+  *right = outR;
 }
 
 uint8_t APU::read8(uint32_t addr) {
@@ -111,6 +153,12 @@ uint16_t APU::read16(uint32_t addr) {
 
 void APU::write16(uint32_t addr, uint16_t value) {
   uint32_t offset = addr - 0x04000000;
+
+  static int logCounter = 0;
+  if (logCounter++ < 50) {
+    printf("APU WRITE: addr=%08X offset=%04X value=%04X\n", addr, offset,
+           value);
+  }
 
   switch (offset) {
   case IO::SOUND1CNT_L: // 0x60 Sweep
@@ -131,6 +179,55 @@ void APU::write16(uint32_t addr, uint16_t value) {
       // Reload envelope, etc.
     }
     break;
+  case IO::SOUNDCNT_L: // 0x80
+    soundcnt_l = value;
+    break;
+  case IO::SOUNDCNT_H: // 0x82
+    soundcnt_h = value;
+    if (value & 0x0800)
+      fifoA.reset();
+    if (value & 0x8000)
+      fifoB.reset();
+    break;
+  case IO::SOUNDCNT_X: // 0x84
+    soundcnt_x = value;
+    break;
+  }
+}
+
+void APU::write32(uint32_t addr, uint32_t value) {
+  uint32_t offset = addr - 0x04000000;
+  if (offset == IO::FIFO_A) {
+    fifoA.push32(value);
+    static int fifoAPushLog = 0;
+    if (fifoAPushLog++ % 500 == 0)
+      printf("APU FIFO A PUSH: %08X (count=%d)\n", value, fifoA.count);
+  } else if (offset == IO::FIFO_B) {
+    fifoB.push32(value);
+    static int fifoBPushLog = 0;
+    if (fifoBPushLog++ % 500 == 0)
+      printf("APU FIFO B PUSH: %08X (count=%d)\n", value, fifoB.count);
+  } else {
+    write16(addr, value & 0xFFFF);
+    write16(addr + 2, (value >> 16) & 0xFFFF);
+  }
+}
+
+void APU::onTimerOverflow(int timerId) {
+  int dmaATimer = (soundcnt_h >> 10) & 1; // Bit 10
+  int dmaBTimer = (soundcnt_h >> 14) & 1; // Bit 14
+
+  if (timerId == dmaATimer) {
+    fifoA.pop();
+    static int popALog = 0;
+    if (popALog++ % 20000 == 0)
+      printf("APU FIFO A POP (count=%d)\n", fifoA.count);
+  }
+  if (timerId == dmaBTimer) {
+    fifoB.pop();
+    static int popBLog = 0;
+    if (popBLog++ % 20000 == 0)
+      printf("APU FIFO B POP (count=%d)\n", fifoB.count);
   }
 }
 

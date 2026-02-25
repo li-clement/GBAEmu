@@ -35,15 +35,39 @@ void PPU::renderScanline(int line, uint32_t *buffer) {
   }
 
   if (mode == 0 || mode == 1) {
-    // Mode 0/1: Tiled layers (all 4 BGs; priority handled by draw order)
-    if (dispcnt & IO::DISPCNT_BG0_ENABLE)
-      renderBackgroundLayer(line, buffer, 0);
-    if (dispcnt & IO::DISPCNT_BG1_ENABLE)
-      renderBackgroundLayer(line, buffer, 1);
-    if (dispcnt & IO::DISPCNT_BG2_ENABLE)
-      renderBackgroundLayer(line, buffer, 2);
-    if (dispcnt & IO::DISPCNT_BG3_ENABLE)
-      renderBackgroundLayer(line, buffer, 3);
+    PixelData lineBuffer[240];
+    for (int x = 0; x < 240; x++) {
+      lineBuffer[x].color = backdrop;
+      lineBuffer[x].priority = 4; // Backdrop has lowest priority
+    }
+
+    // Mode 0/1: Tiled layers
+    // Priority 3 is lowest (drawn first), Priority 0 is highest (drawn last).
+    // For same priority, higher indexed BG has lower priority (drawn first).
+    for (int p = 3; p >= 0; p--) {
+      for (int bg = 3; bg >= 0; bg--) {
+        if (dispcnt & (1 << (8 + bg))) {
+          static const uint32_t BGCNT_OFFS[] = {IO::BG0CNT, IO::BG1CNT,
+                                                IO::BG2CNT, IO::BG3CNT};
+          uint16_t bgcnt = bus->read16(0x04000000 + BGCNT_OFFS[bg]);
+          if ((bgcnt & 0x3) == p) { // BG priority is bits 0-1 of BGCNT
+            renderBackgroundLayer(line, lineBuffer, bg);
+          }
+        }
+      }
+    }
+
+    // Sprites on top (when OBJ enabled)
+    if (dispcnt & IO::DISPCNT_OBJ_ENABLE) {
+      renderSprites(line, lineBuffer);
+    }
+
+    // Composite lineBuffer back into buffer
+    for (int x = 0; x < 240; x++) {
+      if (lineBuffer[x].priority < 4) { // Only draw if not backdrop
+        buffer[x] = lineBuffer[x].color;
+      }
+    }
   } else if (mode == 3) {
     // Mode 3: 240x160 15-bit bitmap, single frame at 0x06000000
     uint32_t lineBase = 0x06000000 + (line * 240 * 2);
@@ -60,7 +84,9 @@ void PPU::renderScanline(int line, uint32_t *buffer) {
     uint32_t lineBase = frameBase + (line * 240);
     for (int x = 0; x < 240; x++) {
       uint8_t index = bus->read8(lineBase + x);
-      if (index != 0) {
+      if (index == 0) {
+        // Transparent in Mode 4 typically shows BG color 0
+      } else {
         uint16_t color15 = bus->read16(0x05000000 + (index * 2));
         uint8_t r = expand5to8(color15 & 0x1F);
         uint8_t g = expand5to8((color15 >> 5) & 0x1F);
@@ -86,16 +112,13 @@ void PPU::renderScanline(int line, uint32_t *buffer) {
   }
 
   // Sprites on top (when OBJ enabled)
-  if (dispcnt & IO::DISPCNT_OBJ_ENABLE) {
-    renderSprites(line, buffer);
-  }
+  // This block is now handled inside the mode 0/1 check for proper compositing
+  // if (dispcnt & IO::DISPCNT_OBJ_ENABLE) {
+  //   renderSprites(line, buffer);
+  // }
 }
 
-void PPU::renderBackground(int line, uint32_t *buffer) {
-  renderBackgroundLayer(line, buffer, 0);
-}
-
-void PPU::renderBackgroundLayer(int line, uint32_t *buffer, int bgIndex) {
+void PPU::renderBackgroundLayer(int line, PixelData *lineBuffer, int bgIndex) {
   static const uint32_t BGCNT_OFFS[] = {IO::BG0CNT, IO::BG1CNT, IO::BG2CNT,
                                         IO::BG3CNT};
   static const uint32_t BGHOFS_OFFS[] = {IO::BG0HOFS, IO::BG1HOFS, IO::BG2HOFS,
@@ -113,20 +136,41 @@ void PPU::renderBackgroundLayer(int line, uint32_t *buffer, int bgIndex) {
   uint32_t vramBase = 0x06000000;
   uint32_t mapBase = vramBase + (screenBaseBlock * 2048);
   uint32_t tileBase = vramBase + (charBaseBlock * 16384);
-  int y = (line + scy) & 0xFF;
+
+  int screenSize = (bgcnt >> 14) & 3;
+  int width = (screenSize & 1) ? 512 : 256;
+  int height = (screenSize & 2) ? 512 : 256;
 
   for (int x = 0; x < 240; x++) {
-    int effectiveX = (x + scx) & 0xFF;
+    int effectiveX = (x + scx) & (width - 1);
+    int effectiveY = (line + scy) & (height - 1);
+
     int tileX = effectiveX / 8;
-    int tileY = y / 8;
-    int mapIndex = tileY * 32 + tileX;
-    uint16_t tileInfo = bus->read16(mapBase + (mapIndex * 2));
+    int tileY = effectiveY / 8;
+
+    int blockX = tileX / 32;
+    int blockY = tileY / 32;
+    int sbbOffset = 0;
+    if (screenSize == 1)
+      sbbOffset = blockX;
+    else if (screenSize == 2)
+      sbbOffset = blockY;
+    else if (screenSize == 3)
+      sbbOffset = blockY * 2 + blockX;
+
+    int localTileX = tileX % 32;
+    int localTileY = tileY % 32;
+    int mapIndex = localTileY * 32 + localTileX;
+
+    uint32_t currentMapBase = mapBase + (sbbOffset * 2048);
+    uint16_t tileInfo = bus->read16(currentMapBase + (mapIndex * 2));
+
     int tileIndex = tileInfo & 0x3FF;
     int hFlip = (tileInfo >> 10) & 1;
     int vFlip = (tileInfo >> 11) & 1;
     int paletteBank = (tileInfo >> 12) & 0xF;
     int localX = effectiveX % 8;
-    int localY = y % 8;
+    int localY = effectiveY % 8;
     if (hFlip)
       localX = 7 - localX;
     if (vFlip)
@@ -149,12 +193,21 @@ void PPU::renderBackgroundLayer(int line, uint32_t *buffer, int bgIndex) {
       uint8_t r = expand5to8(color15 & 0x1F);
       uint8_t g = expand5to8((color15 >> 5) & 0x1F);
       uint8_t b = expand5to8((color15 >> 10) & 0x1F);
-      buffer[x] = (0xFFu << 24) | (b << 16) | (g << 8) | r;
+      uint32_t finalColor = (0xFFu << 24) | (b << 16) | (g << 8) | r;
+
+      // Only draw if not transparent (color 0 in palette is transparent)
+      // or if we have higher priority. BGs with same priority draw over each
+      // other if bgIndex is lower (handled by loop order in renderScanline).
+      if (lineBuffer[x].priority > (bgcnt & 3)) {
+        lineBuffer[x].color = finalColor;
+        lineBuffer[x].priority = bgcnt & 3;
+        lineBuffer[x].isSprite = false;
+      }
     }
   }
 }
 
-void PPU::renderSprites(int line, uint32_t *buffer) {
+void PPU::renderSprites(int line, PixelData *lineBuffer) {
   uint16_t dispcnt = bus->read16(0x04000000 + IO::DISPCNT);
 
   // Check if OBJ is enabled
@@ -234,71 +287,63 @@ void PPU::renderSprites(int line, uint32_t *buffer) {
         int spriteCol = col;
         if (horizontalFlip)
           spriteCol = width - 1 - spriteCol;
-
-        // Calculate Tile Address
-        // 1D Mapping vs 2D Mapping. Standard GBA uses 1D for Bitmapped but Tile
-        // mode 2D? Actually usually 1D mapping in linear VRAM for sprites.
-        // Address = Base + Index * 32.
-        // But GBA Sprites are composed of 8x8 tiles.
-        // We need to find which tile (tx, ty) inside the sprite we are in.
         int tx = spriteCol / 8;
         int ty = spriteRow / 8;
 
-        // Tile Number calculation depends on 1D/2D mapping (DISPCNT bit 6)
-        // Assuming 1D mapping for now (simplest linear).
-        // Or simplified 2D: TileIndex + ty * 32 + tx ?
-        // Let's implement Mapping 1D (DISPCNT & 0x40)
-        bool mapping1D = (dispcnt & 0x40);
+        // VRAM mapping for sprites is either 1D or 2D based on DISPCNT bit 6
+        bool mapping1D = (dispcnt & IO::DISPCNT_OBJ_1D_MAP) != 0;
         int currentTileIndex = tileIndex;
 
         if (mapping1D) {
-          // In 1D, tiles are linear. Stride depends on color depth?
-          // 4bpp: 1 tile = 32 bytes.
-          // Stride is just width/8.
-          currentTileIndex += (ty * (width / 8) + tx) * (colorMode ? 2 : 1);
+          // 1D mapping: tile offsets linearly
+          // stride depends on color depth (1 tile is 32 bytes for 4bpp, 64
+          // bytes for 8bpp) Width in tiles: width / 8
+          int offset = (ty * (width / 8) + tx) * (colorMode ? 2 : 1);
+          currentTileIndex = (currentTileIndex + offset) & 0x3FF;
         } else {
-          // 2D Matrix (32x32 tiles grid in charblock)
-          // Stride is 0x20 (32 tiles per row in VRAM object space conceptually)
-          currentTileIndex += ty * 32 + tx;
+          // 2D mapping: VRAM organized as a 32x32 matrix of tiles
+          currentTileIndex =
+              (currentTileIndex + ty * 32 + tx * (colorMode ? 2 : 1)) & 0x3FF;
         }
 
-        // Offset within tile
         int lx = spriteCol % 8;
         int ly = spriteRow % 8;
 
-        // Read Pixel
-        uint32_t charBase = 0x06010000; // OBJ is 4th/5th charblock usually?
-        // Wait, CharBase for OBJ is always 0x06010000 - 0x06017FFF in Mode 0-2?
-        // Yes, Lower 64KB for BG, Upper 32KB for OBJ.
-
+        uint32_t charBase = 0x06010000;
         uint32_t tileAddr = charBase + (currentTileIndex * 32);
-        uint32_t pixelAddr = tileAddr + (ly * 4) + (lx / 2);
 
         uint8_t index = 0;
         if (colorMode == 0) { // 4bpp
+          uint32_t pixelAddr = tileAddr + (ly * 4) + (lx / 2);
           uint8_t byte = bus->read8(pixelAddr);
-          if (lx & 1)
-            index = (byte >> 4) & 0xF;
-          else
-            index = byte & 0xF;
-        } else {
-          // 8bpp
+          index = (lx & 1) ? ((byte >> 4) & 0xF) : (byte & 0xF);
+        } else { // 8bpp
+          uint32_t pixelAddr =
+              charBase + (currentTileIndex * 32) + (ly * 8) + lx;
+          index = bus->read8(pixelAddr);
         }
 
         if (index != 0) {
-          // Palette lookup
-          // OBJ Palette at 0x05000200
-          uint32_t palAddr = 0x05000200 + (paletteBank * 32) + (index * 2);
+          uint32_t palAddr =
+              colorMode == 0 ? (0x05000200 + (paletteBank * 32) + (index * 2))
+                             : (0x05000200 + (index * 2));
           uint16_t color15 = bus->read16(palAddr);
-
           uint8_t r = expand5to8(color15 & 0x1F);
           uint8_t g = expand5to8((color15 >> 5) & 0x1F);
           uint8_t b = expand5to8((color15 >> 10) & 0x1F);
+          int priority = (attr2 >> 10) & 0x3;
+          uint32_t finalColor = (0xFF << 24) | (b << 16) | (g << 8) | r;
 
-          // Simple overwrite for now
-          // buffer is already offset to the start of the line.
-          // Just use screenX.
-          buffer[screenX] = (0xFF << 24) | (b << 16) | (g << 8) | r;
+          // Only draw if current pixel is empty or we have higher priority
+          // Note: sprites with same priority as BG are drawn on top of BG.
+          // Lower priority number = higher priority.
+          if (lineBuffer[screenX].priority > priority ||
+              (lineBuffer[screenX].priority == priority &&
+               !lineBuffer[screenX].isSprite)) {
+            lineBuffer[screenX].color = finalColor;
+            lineBuffer[screenX].priority = priority;
+            lineBuffer[screenX].isSprite = true;
+          }
         }
       }
     }

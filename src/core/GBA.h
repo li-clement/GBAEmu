@@ -60,6 +60,7 @@ private:
 
   void checkDMA();
   void transferDMA(int channel);
+  void latchDMA(int channel);
 
   bool hasBIOS = false;
 };

@@ -19,6 +19,7 @@ public:
   // Helpers for Bus
   uint16_t read16(uint32_t addr);
   void write16(uint32_t addr, uint16_t value);
+  void write32(uint32_t addr, uint32_t value);
 
   // Audio Output
   std::vector<int16_t> outputBuffer;
@@ -37,6 +38,58 @@ private:
   uint16_t sound1cnt_h;
   uint16_t sound1cnt_x;
 
+  // DirectSound Registers
+  uint16_t soundcnt_l; // 0x080: Master Volume
+  uint16_t soundcnt_h; // 0x082: DirectSound Control
+  uint16_t soundcnt_x; // 0x084: Sound Enable
+
+  // FIFO Structures
+  struct AudioFIFO {
+    int8_t data[32];
+    int readPos = 0;
+    int writePos = 0;
+    int count = 0;
+    int8_t lastSample = 0;
+
+    void push32(uint32_t val) {
+      for (int i = 0; i < 4; i++) {
+        if (count < 32) {
+          data[writePos] = (val >> (i * 8)) & 0xFF;
+          writePos = (writePos + 1) % 32;
+          count++;
+        }
+      }
+    }
+
+    int8_t pop() {
+      if (count > 0) {
+        lastSample = data[readPos];
+        readPos = (readPos + 1) % 32;
+        count--;
+      }
+      return lastSample;
+    }
+
+    void reset() {
+      readPos = 0;
+      writePos = 0;
+      count = 0;
+      lastSample = 0;
+    }
+  };
+
+  AudioFIFO fifoA;
+  AudioFIFO fifoB;
+
+  // Timer Override Hooks
+public:
+  void onTimerOverflow(int timerId);
+  int fifoA_count() const { return fifoA.count; }
+  int fifoB_count() const { return fifoB.count; }
+  int timerForFifoA() const { return (soundcnt_h >> 10) & 1; }
+  int timerForFifoB() const { return (soundcnt_h >> 14) & 1; }
+
+private:
   // Channel 1 State (Square 1)
   struct SquareChannel {
     bool enabled;

@@ -32,6 +32,8 @@ public:
 
   // Special IO methods
   void setKeyInput(uint16_t value);
+  void requestInterrupt(uint16_t flag);
+  void lockBIOSVectorTable() { vectorTableWritable_ = false; }
 
   void loadBIOS(const std::vector<uint8_t> &data);
   void loadROM(const std::vector<uint8_t> &data);

@@ -45,6 +45,10 @@ public:
 
   void reset();
   uint32_t getPC() const { return registers[15]; }
+  bool isIRQEnabled() const { return (cpsr & 0x80) == 0; }
+  bool isHalted() const { return halted; }
+  void setHalted(bool h) { halted = h; }
+  void setHasBIOS(bool b) { hasBIOS_ = b; }
   void
   setEntryPoint(uint32_t addr); // 设置 PC 并重填流水线（有 BIOS 时从 0 启动）
   void step();
@@ -89,6 +93,8 @@ private:
 
   uint32_t pipeline[2];
   bool pipelineFlushed;
+  bool halted = false;   // SWI IntrWait/VBlankIntrWait 暂停 CPU
+  bool hasBIOS_ = false; // 是否加载了真实 BIOS
 
   // Instruction decoding
   void executeARM(uint32_t opcode);

@@ -76,6 +76,12 @@ uint16_t Bus::read16(uint32_t addr) {
   if ((addr >> 24) == 0x02) {
     return *(uint16_t *)&wram_board[addr & 0x3FFFE];
   }
+  // 快速路径：ROM (0x08)
+  if ((addr >> 24) == 0x08) {
+    if ((addr & 0x00FFFFFF) < rom.size() - 1)
+      return *(uint16_t *)&rom[(addr & 0x00FFFFFF) & ~1];
+    return 0; // Out of bounds ROM read
+  }
   return read8(addr) | (read8(addr + 1) << 8);
 }
 
@@ -92,13 +98,22 @@ uint32_t Bus::read32(uint32_t addr) {
   if ((addr >> 24) == 0x02) {
     return *(uint32_t *)&wram_board[addr & 0x3FFFC];
   }
+  // 快速路径：ROM (0x08)
+  if ((addr >> 24) == 0x08) {
+    if ((addr & 0x00FFFFFF) < rom.size() - 3)
+      return *(uint32_t *)&rom[(addr & 0x00FFFFFF) & ~3];
+    return 0; // Out of bounds ROM read
+  }
   return read16(addr) | (read16(addr + 2) << 16);
 }
 
 void Bus::write8(uint32_t addr, uint8_t value) {
-  // 仅当未加载真实 BIOS 时允许写向量表 (0x00-0x3F)，供游戏安装 IRQ handler
-  if (addr < 0x40 && vectorTableWritable_) {
-    bios[addr] = value;
+  // BIOS 区域写保护：加载真实 BIOS 后或 lockBIOSVectorTable 后整个区域只读
+  // vectorTableWritable_=true 时允许写入（供 HLE handler 安装）
+  if (addr < 0x00004000) {
+    if (vectorTableWritable_) {
+      bios[addr] = value;
+    }
     return;
   }
 
@@ -113,7 +128,12 @@ void Bus::write8(uint32_t addr, uint8_t value) {
     if (apu && offset >= 0x60 && offset <= 0xA8) {
       apu->write8(addr, value);
     }
-    io_regs[offset] = value;
+    if (offset == 0x202 || offset == 0x203) {
+      // IF register clear by writing 1
+      io_regs[offset] &= ~value;
+    } else {
+      io_regs[offset] = value;
+    }
   } else if (addr >= 0x05000000 && addr < 0x05000400) {
     palette[addr - 0x05000000] = value;
   } else if (addr >= 0x06000000 && addr < 0x06018000) {
@@ -126,19 +146,24 @@ void Bus::write8(uint32_t addr, uint8_t value) {
 void Bus::write16(uint32_t addr, uint16_t value) {
   // Write to IO
   if ((addr >> 24) == 0x04) {
-    if (addr == 0x04000000) {
-      uint32_t pc = cpu ? cpu->getPC() : 0;
-      printf("Bus: Write DISPCNT = %04X at PC=%08X\n", value, pc);
-    } else if (addr == 0x04000004) {
-      uint32_t pc = cpu ? cpu->getPC() : 0;
-      printf("Bus: Write DISPSTAT = %04X at PC=%08X\n", value, pc);
+    uint32_t offset = addr & 0x3FF;
+    if (apu && offset >= 0x60 && offset <= 0xA8) {
+      apu->write16(addr, value);
     }
-    // Mask out read-only bits or unimplemented IO?
-    // For now allow raw write.
-    // ...
-    // Note: Some IO regs are 8/16/32 specific.
-    // We are in write16.
-    *(uint16_t *)&io_regs[addr & 0x3FF] = value;
+    if (offset >= 0xB0 && offset <= 0xDF) {
+      static int dmaWriteLog = 0;
+      if (dmaWriteLog++ < 100) {
+        printf("BUS DMA WRITE16: addr=%08X offset=%04X value=%04X\n", addr,
+               offset, value);
+      }
+    }
+    if (offset == 0x202) {
+      // REG_IF is acknowledge-by-writing-1
+      uint16_t currentIF = *(uint16_t *)&io_regs[0x202];
+      *(uint16_t *)&io_regs[0x202] = currentIF & ~value;
+    } else {
+      *(uint16_t *)&io_regs[offset] = value;
+    }
     return;
   }
   // 快速路径：IWRAM
@@ -151,11 +176,44 @@ void Bus::write16(uint32_t addr, uint16_t value) {
     *(uint16_t *)&wram_board[addr & 0x3FFFE] = value;
     return;
   }
+  // Palette (0x05)
+  if ((addr >> 24) == 0x05) {
+    *(uint16_t *)&palette[(addr - 0x05000000) & 0x3FE] = value;
+    return;
+  }
+  // VRAM (0x06)
+  if ((addr >> 24) == 0x06) {
+    *(uint16_t *)&vram[(addr - 0x06000000) % 0x18000] = value;
+    return;
+  }
+  // OAM (0x07)
+  if ((addr >> 24) == 0x07) {
+    *(uint16_t *)&oam[(addr - 0x07000000) & 0x3FE] = value;
+    return;
+  }
   write8(addr, value & 0xFF);
   write8(addr + 1, (value >> 8) & 0xFF);
 }
 
 void Bus::write32(uint32_t addr, uint32_t value) {
+  // IO Registers
+  if ((addr >> 24) == 0x04) {
+    uint32_t offset = addr & 0x3FF;
+    // APU FIFO 必须整字写入
+    if (apu && offset >= 0x60 && offset <= 0xA8) {
+      apu->write32(addr, value);
+      return;
+    }
+    // DMA SAD/DAD 等 32 位寄存器直接写（不含 CNT_H 等需要副作用的地址）
+    if (offset >= 0xB0 && offset <= 0xDF && (offset & 3) != 0xA) {
+      *(uint32_t *)&io_regs[offset] = value;
+      return;
+    }
+    // 其他 IO 通过 write16 拆分，保留副作用
+    write16(addr, value & 0xFFFF);
+    write16(addr + 2, (value >> 16) & 0xFFFF);
+    return;
+  }
   // 快速路径：IWRAM
   if ((addr >> 24) == 0x03) {
     *(uint32_t *)&wram_chip[addr & 0x7FFC] = value;
@@ -164,6 +222,21 @@ void Bus::write32(uint32_t addr, uint32_t value) {
   // 快速路径：EWRAM
   if ((addr >> 24) == 0x02) {
     *(uint32_t *)&wram_board[addr & 0x3FFFC] = value;
+    return;
+  }
+  // Palette (0x05)
+  if ((addr >> 24) == 0x05) {
+    *(uint32_t *)&palette[(addr - 0x05000000) & 0x3FC] = value;
+    return;
+  }
+  // VRAM (0x06)
+  if ((addr >> 24) == 0x06) {
+    *(uint32_t *)&vram[(addr - 0x06000000) % 0x18000] = value;
+    return;
+  }
+  // OAM (0x07)
+  if ((addr >> 24) == 0x07) {
+    *(uint32_t *)&oam[(addr - 0x07000000) & 0x3FC] = value;
     return;
   }
   write16(addr, value & 0xFFFF);
@@ -177,6 +250,11 @@ void Bus::setKeyInput(uint16_t value) {
     io_regs[offset] = value & 0xFF;
     io_regs[offset + 1] = (value >> 8) & 0xFF;
   }
+}
+
+void Bus::requestInterrupt(uint16_t flag) {
+  uint16_t currentIF = *(uint16_t *)&io_regs[0x202];
+  *(uint16_t *)&io_regs[0x202] = currentIF | flag;
 }
 
 // setAPU moved to header inline

@@ -4,7 +4,9 @@
 #include "IORegisters.h"
 #import <AudioToolbox/AudioToolbox.h>
 #import <MetalKit/MetalKit.h>
+#include <chrono>
 #import <simd/simd.h>
+#include <thread>
 #include <vector>
 
 // 简单顶点结构
@@ -53,12 +55,11 @@ static const int kMaxInflightBuffers = 3;
   id<MTLCommandQueue> _commandQueue;
   id<MTLRenderPipelineState> _pipelineState;
 
-  // Triple Buffering
-  id<MTLBuffer> _screenBuffers[kMaxInflightBuffers];
-  id<MTLTexture> _screenTextures[kMaxInflightBuffers];
+  // Decoupled Buffering
+  std::vector<uint32_t> _cpuBuffer;
+  std::vector<uint32_t> _readyBuffer;
 
-  dispatch_semaphore_t _frameSemaphore; // Control CPU producing speed
-  int _currentFrameIndex;               // For CPU production
+  id<MTLTexture> _displayTexture; // Single GPU Texture
 
   // Threading
   dispatch_queue_t _emulationQueue;
@@ -77,9 +78,9 @@ static const int kMaxInflightBuffers = 3;
   BOOL _loadedRealROM; // YES = ROM from file (skip test scene), NO = dummy (run
                        // test scene)
 
-  // Sync for Rendering
-  id<MTLTexture> _displayTexture; // Texture currently being displayed
-  NSLock *_displayLock;           // Protects _displayTexture access
+  NSLock *_displayLock; // Protects _readyBuffer access
+  NSLock *_coreLock;    // Protects _gba access
+  bool _newFrameReady;  // Signals drawInMTKView to replaceRegion
 }
 
 - (instancetype)initWithFrame:(CGRect)frame {
@@ -90,10 +91,13 @@ static const int kMaxInflightBuffers = 3;
       return nil;
     }
 
-    self.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
+    self.colorPixelFormat = MTLPixelFormatRGBA8Unorm;
+    self.preferredFramesPerSecond = 60;
     self.delegate = self;
 
     _commandQueue = [self.device newCommandQueue];
+
+    _coreLock = [[NSLock alloc] init];
 
     [self buildResources];
     [self buildPipeline];
@@ -225,6 +229,12 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
     memcpy(buffer->mAudioData, _audioRingBuffer.data(), availableBytes);
     _audioRingBuffer.clear();
     buffer->mAudioDataByteSize = (UInt32)bytesToCopy;
+
+    static int starvLog = 0;
+    if (starvLog++ % 60 == 0) {
+      NSLog(@"AUDIO STARVATION: Needed %zu but had %zu", bytesToCopy,
+            availableBytes);
+    }
   } else {
     memcpy(buffer->mAudioData, _audioRingBuffer.data(), bytesToCopy);
     _audioRingBuffer.erase(_audioRingBuffer.begin(),
@@ -286,30 +296,25 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
   NSUInteger bytesPerRow = 1024;
   NSUInteger bufferSize = bytesPerRow * 160;
 
+  // Create the single GPU texture
   MTLTextureDescriptor *textureDescriptor = [MTLTextureDescriptor
       texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                                    width:240
                                   height:160
                                mipmapped:NO];
-  textureDescriptor.storageMode = MTLStorageModeShared;
+  textureDescriptor.usage = MTLTextureUsageShaderRead;
+  // Managed storage mode ensures CPU -> GPU copy works synchronously via
+  // replaceRegion
+  textureDescriptor.storageMode = MTLStorageModeManaged;
 
-  for (int i = 0; i < kMaxInflightBuffers; i++) {
-    _screenBuffers[i] =
-        [self.device newBufferWithLength:bufferSize
-                                 options:MTLResourceStorageModeShared];
-    _screenTextures[i] =
-        [_screenBuffers[i] newTextureWithDescriptor:textureDescriptor
-                                             offset:0
-                                        bytesPerRow:bytesPerRow];
-  }
-
-  _frameSemaphore = dispatch_semaphore_create(kMaxInflightBuffers);
-  _currentFrameIndex = 0;
+  _displayTexture = [self.device newTextureWithDescriptor:textureDescriptor];
+  _cpuBuffer.resize(240 * 160, 0);
+  _readyBuffer.resize(240 * 160, 0);
+  _newFrameReady = false;
 
   _emulationQueue =
       dispatch_queue_create("com.gbaemu.core", DISPATCH_QUEUE_SERIAL);
   _displayLock = [[NSLock alloc] init];
-  _currentFrameIndex = 0;
 
   [self setupAudio];
   // _running 和 startEmulationLoop 已移到 initWithFrame 末尾
@@ -318,20 +323,16 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
 - (void)loadROM:(NSData *)romData {
   if (!romData || romData.length == 0)
     return;
-
-  // Stop emulation loop temporarily?
-  // Ideally we should lock. But for now let's just update.
-  // The emulation loop checks _running.
+  if (_gba == nullptr)
+    return;
 
   std::vector<uint8_t> data(romData.length);
   memcpy(data.data(), romData.bytes, romData.length);
 
-  // We should probably lock here to avoid race conditions with stepFrame
-  // But since it's a completely new ROM, let's just do it.
-  // Ideally: pause -> load -> reset -> resume.
-
+  [_coreLock lock];
   _gba->loadROM(data);
   _gba->reset();
+  [_coreLock unlock];
 }
 
 - (void)buildPipeline {
@@ -374,41 +375,58 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
       if (!strongSelf || !strongSelf->_running)
         break;
 
-      // Wait for available buffer
-      dispatch_semaphore_wait(strongSelf->_frameSemaphore,
-                              DISPATCH_TIME_FOREVER);
-
-      int index = strongSelf->_currentFrameIndex;
-      id<MTLBuffer> buffer = strongSelf->_screenBuffers[index];
-      id<MTLTexture> texture = strongSelf->_screenTextures[index];
-
       // Run Emulation (Produces 1 frame)
-      // We need to throttle this to ~60Hz or let it fly?
-      // Since we use a semaphore with kMaxInflightBuffers=3,
-      // and drawInMTKView signals it back, this naturally throttles
-      // the loop to the render speed (VSync).
-      // Perfect!
+      [strongSelf->_coreLock lock];
+      strongSelf->_gba->stepFrame(strongSelf->_cpuBuffer.data(), 1024);
 
-      strongSelf->_gba->stepFrame((uint32_t *)buffer.contents, 1024);
-
-      // Push Audio
+      // Push Audio and Sync Speed strictly to 44100Hz playback rate!
       {
         auto &audioOut = strongSelf->_gba->getAPU().getBuffer();
+
+        // Audio Sync Throttle: Block if buffer is > 4096 samples (approx. 90ms
+        // of lag!)
+        while (true) {
+          if (!strongSelf || !strongSelf->_running)
+            break;
+          bool full = false;
+          [strongSelf->_audioLock lock];
+          if (strongSelf->_audioRingBuffer.size() > 4096) {
+            full = true;
+          }
+          [strongSelf->_audioLock unlock];
+
+          if (!full)
+            break;
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
         [strongSelf->_audioLock lock];
         strongSelf->_audioRingBuffer.insert(strongSelf->_audioRingBuffer.end(),
                                             audioOut.begin(), audioOut.end());
         [strongSelf->_audioLock unlock];
+
+        static int mixLog = 0;
+        if (mixLog++ % 60 == 0) {
+          int nonZeroCount = 0;
+          for (auto s : audioOut)
+            if (s != 0)
+              nonZeroCount++;
+          NSLog(@"AUDIO MIX: Pushed %zu samples. Non-zero: %d. Ring Buffer "
+                @"size: %zu",
+                audioOut.size(), nonZeroCount,
+                strongSelf->_audioRingBuffer.size());
+        }
+
         strongSelf->_gba->getAPU().clearBuffer();
       }
+      [strongSelf->_coreLock unlock];
 
-      // Update Display Texture safely
+      // Publish new frame to readyBuffer
       [strongSelf->_displayLock lock];
-      strongSelf->_displayTexture = texture;
+      memcpy(strongSelf->_readyBuffer.data(), strongSelf->_cpuBuffer.data(),
+             240 * 160 * 4);
+      strongSelf->_newFrameReady = true;
       [strongSelf->_displayLock unlock];
-
-      // Advance index
-      strongSelf->_currentFrameIndex =
-          (strongSelf->_currentFrameIndex + 1) % kMaxInflightBuffers;
     }
   });
 }
@@ -463,49 +481,22 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
 }
 
 - (void)drawInMTKView:(MTKView *)view {
-  // [self updateGameLogic]; // Logic moved to background thread
-
-  // Grab the latest ready texture
-  id<MTLTexture> currentTex = nil;
-  [self->_displayLock lock];
-  currentTex = self->_displayTexture;
-  [self->_displayLock unlock];
-
-  if (!currentTex)
+  if (!_displayTexture)
     return;
+
+  bool uploadNeeded = false;
+  [self->_displayLock lock];
+  if (self->_newFrameReady) {
+    [self->_displayTexture replaceRegion:MTLRegionMake2D(0, 0, 240, 160)
+                             mipmapLevel:0
+                               withBytes:self->_readyBuffer.data()
+                             bytesPerRow:1024];
+    self->_newFrameReady = false;
+  }
+  [self->_displayLock unlock];
 
   id<MTLCommandBuffer> commandBuffer = [_commandQueue commandBuffer];
   commandBuffer.label = @"MyCommand";
-
-  // When buffer is consumed (GPU finished), signal that we can reuse a slot?
-  // Wait, our semaphore logic in startEmulationLoop waits for SPACE.
-  // We need to signal "Space Available" when we are done with a frame.
-  // But we are using a "Latest Frame" model for display (dropping frames if
-  // rendering is slow), OR we are using a "FIFO" model? The current semaphore
-  // logic: wait -> produce -> set display -> loop. NO SIGNAL? Then it will
-  // deadlock after 3 frames. We MUST signal. When do we signal? If we treat it
-  // as a ring buffer of *available slots* for CPU. CPU takes a slot, fills it.
-  // When GPU is done reading it, we give it back.
-  // BUT we only display the *latest*.
-  // So:
-  // CPU fills 0, 1, 2...
-  // Display picks 2.
-  // 0 and 1 are "done" immediately if skipped.
-  // If we pick 2, when 2 is done on GPU, we signal.
-  // This is tricky with "Latest".
-
-  // Alternative: Strict FIFO.
-  // CPU produces. Display consumes.
-  // If Display is 60Hz and CPU is >60Hz, CPU blocks.
-  // If CPU is <60Hz, Display re-uses old frame?
-
-  // Let's implement Strict FIFO to ensure 60FPS throttling.
-  // We signal the semaphore when the GPU has scheduled the frame.
-  // Actually, simpler: Signal it in the completion handler.
-
-  [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer>) {
-    dispatch_semaphore_signal(self->_frameSemaphore);
-  }];
 
   MTLRenderPassDescriptor *renderPassDescriptor =
       view.currentRenderPassDescriptor;
@@ -520,7 +511,7 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
 
     [renderEncoder setRenderPipelineState:_pipelineState];
     [renderEncoder setVertexBuffer:_vertexBuffer offset:0 atIndex:0];
-    [renderEncoder setFragmentTexture:currentTex atIndex:0];
+    [renderEncoder setFragmentTexture:_displayTexture atIndex:0];
 
     [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle
                       vertexStart:0

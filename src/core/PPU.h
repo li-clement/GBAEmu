@@ -18,9 +18,14 @@ public:
 private:
   std::shared_ptr<Bus> bus;
 
-  void renderBackground(int line, uint32_t *buffer);
-  void renderBackgroundLayer(int line, uint32_t *buffer, int bgIndex);
-  void renderSprites(int line, uint32_t *buffer);
+  struct PixelData {
+    uint32_t color = 0;
+    uint8_t priority = 4; // 0 (Highest) to 3 (Lowest), 4 is empty
+    bool isSprite = false;
+  };
+
+  void renderBackgroundLayer(int line, PixelData *lineBuffer, int bgIndex);
+  void renderSprites(int line, PixelData *lineBuffer);
 };
 
 } // namespace Core
