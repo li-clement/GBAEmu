@@ -72,52 +72,6 @@ void GBA::step() {
 }
 
 void GBA::stepFrame(uint32_t *buffer, size_t stride) {
-  if (!buffer) {
-    printf("stepFrame: null buffer!\n");
-    fflush(stdout);
-    return;
-  }
-  static int frameCount = 0;
-  frameCount++;
-
-  // Disable heavy logging
-  // Debugger::getInstance().enable(true);
-
-  static bool biosAdvanced = false;
-  if (!biosAdvanced && cpu->getPC() > 0x1000 && cpu->getPC() < 0x4000) {
-    biosAdvanced = true;
-    printf("GBAEmu: BIOS ADVANCED PAST 0x1000! PC=%08X\n", cpu->getPC());
-  }
-
-  // HLE BOOT TRACE
-  // if (cpu->getPC() >= 0x08000000 && frameCount < 3) {
-  //     Debugger::getInstance().enable(true);
-  // } else {
-  //     Debugger::getInstance().enable(false);
-  // }
-
-  // Debug Loop at 082C9027 -> Caller at 082D8200
-  if (cpu->getPC() >= 0x082D8200 && cpu->getPC() <= 0x082D8220) {
-    Debugger::getInstance().enable(true);
-  } else {
-    Debugger::getInstance().enable(false);
-  }
-
-  // Trace Frame 3-20 (Transitions to loop?)
-  if (frameCount >= 3 && frameCount < 20) {
-    Debugger::getInstance().enable(true);
-  } else {
-    Debugger::getInstance().enable(false);
-  }
-
-  if ((frameCount % 60) == 0 && cpu->getPC() >= 0x08000000) {
-    uint16_t dispcnt = bus->read16(0x04000000);
-    uint16_t dispstat = bus->read16(0x04000004);
-    uint16_t ie = bus->read16(0x04000200);
-    uint16_t interrupt_flag = bus->read16(0x04000202);
-    printf("PPU DEBUG: CNT=%04X STAT=%04X IE=%04X IF=%04X PC=%08X\n", dispcnt,
-           dispstat, ie, interrupt_flag, cpu->getPC());
-  }
 
   for (int line = 0; line < TOTAL_LINES; line++) {
     bus->write16(0x04000006, line);
@@ -157,7 +111,7 @@ void GBA::stepFrame(uint32_t *buffer, size_t stride) {
       checkInterrupts();
     }
 
-    if (line < VISIBLE_LINES) {
+    if (line < VISIBLE_LINES && buffer != nullptr) {
       size_t pixelStride = stride / 4;
       ppu->renderScanline(line, buffer + (line * pixelStride));
     }
@@ -174,27 +128,6 @@ void GBA::stepFrame(uint32_t *buffer, size_t stride) {
           transferDMA(c);
         }
       }
-    }
-
-    // Check for ROM entry
-    static bool romEntered = false;
-    if (!romEntered && cpu->getPC() >= 0x08000000) {
-      romEntered = true;
-      printf("GBAEmu: JUMP TO ROM CONFIRMED! PC=0x%08X\n", cpu->getPC());
-    }
-
-    static int palDumpCount = 0;
-    if (line == 159 && palDumpCount++ % 60 == 0) {
-      printf("PALETTE DUMP (Frame %d): ", palDumpCount / 60);
-      for (int i = 0; i < 16; i++) {
-        printf("%04X ", bus->read16(0x05000000 + i * 2));
-      }
-      printf("\n");
-      printf("VRAM DUMP BG: ");
-      for (int i = 0; i < 8; i++) {
-        printf("%04X ", bus->read16(0x06000000 + i * 2));
-      }
-      printf("\n");
     }
 
     // VBlank 开始时触发 VBlank IRQ 和 DMA
@@ -304,25 +237,6 @@ void GBA::transferDMA(int channel) {
   if (isSoundDMA) {
     width = 4;
     dstAdj = 2; // Fixed
-  }
-
-  // DEBUG SOUND DMA
-  if (dad == 0x040000A0 || dad == 0x040000A4) {
-    static int soundDmaLog = 0;
-    if (soundDmaLog++ < 100) {
-      if (soundDmaLog % 10 == 0)
-        printf("SOUND DMA: channel=%d timing=%d sad=%08X dad=%08X count=%d "
-               "width=%d\n",
-               channel, timing, sad, dad, dma[channel].count, width);
-    }
-  }
-
-  static int dmaLog = 0;
-  if (dad == 0x05000000 && dmaLog++ < 5) {
-    printf("DMA%d PALETTE: SAD=%08X DAD=%08X CNT=%d WIDTH=%d SRCADJ=%d\n",
-           channel, sad, dad, count, width, srcAdj);
-    printf("ROM AT SAD: %04X %04X %04X %04X\n", bus->read16(sad),
-           bus->read16(sad + 2), bus->read16(sad + 4), bus->read16(sad + 6));
   }
 
   // Perform Transfer
@@ -511,17 +425,6 @@ void GBA::updateTimers(int cycles) {
     }
   };
 
-  static int logTimerDmaStatus = 0;
-  if (logTimerDmaStatus++ % 10000 == 0) {
-    if (dma[1].active || dma[2].active) {
-      printf("TIMER STATUS: DMA1 Active=%d Dad=%08X  DMA2 Active=%d Dad=%08X  "
-             "FifoA cnt=%d (T%d) FifoB cnt=%d (T%d)\n",
-             dma[1].active, dma[1].dad, dma[2].active, dma[2].dad,
-             apu->fifoA_count(), apu->timerForFifoA(), apu->fifoB_count(),
-             apu->timerForFifoB());
-    }
-  }
-
   // Basic Timer Implementation
   for (int i = 0; i < 4; i++) {
     uint32_t cnt_h_addr = 0x04000102 + (i * 4);
@@ -566,11 +469,6 @@ void GBA::updateTimers(int cycles) {
         if (timers[i].counter == 0) { // Overflow
           // Read the reload latch directly from the bus (where game writes it)
           timers[i].counter = bus->read16(cnt_l_addr);
-
-          static int timerOverflowLog = 0;
-          if (timerOverflowLog++ % 44000 == 0)
-            printf("TIMER OVERFLOW: Timer %d, Reload Latch = %04X\n", i,
-                   timers[i].counter);
 
           // DirectSound FIFO Pop
           apu->onTimerOverflow(i);

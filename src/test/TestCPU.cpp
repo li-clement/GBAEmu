@@ -26,6 +26,11 @@ void testARMDataProcessing() {
   // EAFFFFFE
   bus->write32(0x00000008, 0xEAFFFFFE);
 
+  // CPU reset() calls reloadPipeline which calls bus->read32, 
+  // ensuring we run reset() *after* writes are finished 
+  // avoids Bus returning garbage before memory is set if needed.
+  // Actually, wait, Bus constructor calls initMemoryMap, so pointers 
+  // should be valid. Let's make sure.
   cpu->reset();
   cpu->setPC(0x00000000);
 

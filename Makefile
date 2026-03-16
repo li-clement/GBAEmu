@@ -1,8 +1,8 @@
 # Makefile for M1 GBA Emulator
 
 CXX := clang++
-CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -fobjc-arc -arch arm64 -Isrc -Isrc/core -Isrc/platform
-LDFLAGS := -framework Cocoa -framework Metal -framework MetalKit -framework AudioToolbox -arch arm64
+CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -fobjc-arc -arch arm64 -mcpu=apple-m1 -flto -Isrc -Isrc/core -Isrc/platform
+LDFLAGS := -framework Cocoa -framework Metal -framework MetalKit -framework AudioToolbox -arch arm64 -flto
 
 SRC_DIR := src
 BUILD_DIR := build

@@ -154,11 +154,7 @@ uint16_t APU::read16(uint32_t addr) {
 void APU::write16(uint32_t addr, uint16_t value) {
   uint32_t offset = addr - 0x04000000;
 
-  static int logCounter = 0;
-  if (logCounter++ < 50) {
-    printf("APU WRITE: addr=%08X offset=%04X value=%04X\n", addr, offset,
-           value);
-  }
+
 
   switch (offset) {
   case IO::SOUND1CNT_L: // 0x60 Sweep
@@ -199,14 +195,8 @@ void APU::write32(uint32_t addr, uint32_t value) {
   uint32_t offset = addr - 0x04000000;
   if (offset == IO::FIFO_A) {
     fifoA.push32(value);
-    static int fifoAPushLog = 0;
-    if (fifoAPushLog++ % 500 == 0)
-      printf("APU FIFO A PUSH: %08X (count=%d)\n", value, fifoA.count);
   } else if (offset == IO::FIFO_B) {
     fifoB.push32(value);
-    static int fifoBPushLog = 0;
-    if (fifoBPushLog++ % 500 == 0)
-      printf("APU FIFO B PUSH: %08X (count=%d)\n", value, fifoB.count);
   } else {
     write16(addr, value & 0xFFFF);
     write16(addr + 2, (value >> 16) & 0xFFFF);
@@ -219,15 +209,9 @@ void APU::onTimerOverflow(int timerId) {
 
   if (timerId == dmaATimer) {
     fifoA.pop();
-    static int popALog = 0;
-    if (popALog++ % 20000 == 0)
-      printf("APU FIFO A POP (count=%d)\n", fifoA.count);
   }
   if (timerId == dmaBTimer) {
     fifoB.pop();
-    static int popBLog = 0;
-    if (popBLog++ % 20000 == 0)
-      printf("APU FIFO B POP (count=%d)\n", fifoB.count);
   }
 }
 

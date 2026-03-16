@@ -17,6 +17,7 @@ Bus::Bus() {
   vram.resize(96 * 1024);
   oam.resize(1024);
   rom.resize(32 * 1024 * 1024); // Pre-allocate max size for simplicity
+  initMemoryMap();
 }
 
 Bus::~Bus() {}
@@ -31,6 +32,32 @@ void Bus::loadBIOS(const std::vector<uint8_t> &data) {
 void Bus::loadROM(const std::vector<uint8_t> &data) {
   if (data.size() <= rom.size()) {
     std::copy(data.begin(), data.end(), rom.begin());
+  }
+}
+
+void Bus::initMemoryMap() {
+  for (int i = 0; i < 256; i++) {
+    memory_map[i] = nullptr;
+  }
+
+  // BIOS 0x00
+  memory_map[0x00] = bios.data();
+  // EWRAM 0x02
+  memory_map[0x02] = wram_board.data();
+  // IWRAM 0x03
+  memory_map[0x03] = wram_chip.data();
+  // IO 0x04
+  memory_map[0x04] = io_regs.data();
+  // Palette 0x05
+  memory_map[0x05] = palette.data();
+  // VRAM 0x06
+  memory_map[0x06] = vram.data();
+  // OAM 0x07
+  memory_map[0x07] = oam.data();
+
+  // ROM 0x08 - 0x0D (mirrors)
+  for (int i = 0x08; i <= 0x0D; i++) {
+    memory_map[i] = rom.data();
   }
 }
 
@@ -64,46 +91,84 @@ uint8_t Bus::read8(uint32_t addr) {
 }
 
 uint16_t Bus::read16(uint32_t addr) {
-  // 快速路径：BIOS 访问 (0x00xxxxxx)
-  if (addr < 0x3FFF) {
-    return *(uint16_t *)&bios[addr & ~1];
+  uint8_t page = addr >> 24;
+  uint8_t *ptr = memory_map[page];
+
+  if (ptr) {
+    switch (page) {
+    case 0x00:
+      if (addr < 0x4000)
+        return *(uint16_t *)&ptr[addr & ~1];
+      return 0; // BIOS 越界
+    case 0x02:
+      return *(uint16_t *)&ptr[addr & 0x3FFFE];
+    case 0x03:
+      return *(uint16_t *)&ptr[addr & 0x7FFE];
+    case 0x04:
+      return read8(addr) | (read8(addr + 1) << 8); // IO 需要副作用处理
+    case 0x05:
+      return *(uint16_t *)&ptr[(addr - 0x05000000) & 0x3FE];
+    case 0x06:
+      return *(uint16_t *)&ptr[(addr - 0x06000000) % 0x18000];
+    case 0x07:
+      return *(uint16_t *)&ptr[(addr - 0x07000000) & 0x3FE];
+    case 0x08:
+    case 0x09:
+    case 0x0A:
+    case 0x0B:
+    case 0x0C:
+    case 0x0D: {
+      uint32_t offset = addr & 0x01FFFFFF;
+      if (offset < rom.size() - 1)
+        return *(uint16_t *)&ptr[offset & ~1];
+      return 0;
+    }
+    default:
+      break;
+    }
   }
-  // 快速路径：IWRAM (0x03xxxxxx)
-  if ((addr >> 24) == 0x03) {
-    return *(uint16_t *)&wram_chip[addr & 0x7FFE];
-  }
-  // 快速路径：EWRAM (0x02xxxxxx)
-  if ((addr >> 24) == 0x02) {
-    return *(uint16_t *)&wram_board[addr & 0x3FFFE];
-  }
-  // 快速路径：ROM (0x08)
-  if ((addr >> 24) == 0x08) {
-    if ((addr & 0x00FFFFFF) < rom.size() - 1)
-      return *(uint16_t *)&rom[(addr & 0x00FFFFFF) & ~1];
-    return 0; // Out of bounds ROM read
-  }
+
   return read8(addr) | (read8(addr + 1) << 8);
 }
 
 uint32_t Bus::read32(uint32_t addr) {
-  // 快速路径：BIOS
-  if (addr < 0x3FFC) {
-    return *(uint32_t *)&bios[addr & ~3];
+  uint8_t page = addr >> 24;
+  uint8_t *ptr = memory_map[page];
+
+  if (ptr) {
+    switch (page) {
+    case 0x00:
+      if (addr < 0x4000)
+        return *(uint32_t *)&ptr[addr & ~3];
+      return 0; // BIOS 越界
+    case 0x02:
+      return *(uint32_t *)&ptr[addr & 0x3FFFC];
+    case 0x03:
+      return *(uint32_t *)&ptr[addr & 0x7FFC]; // 32KB IWRAM
+    case 0x04:
+      return read16(addr) | (read16(addr + 2) << 16); // IO 需要副作用
+    case 0x05:
+      return *(uint32_t *)&ptr[(addr - 0x05000000) & 0x3FC];
+    case 0x06:
+      return *(uint32_t *)&ptr[(addr - 0x06000000) % 0x18000];
+    case 0x07:
+      return *(uint32_t *)&ptr[(addr - 0x07000000) & 0x3FC];
+    case 0x08:
+    case 0x09:
+    case 0x0A:
+    case 0x0B:
+    case 0x0C:
+    case 0x0D: {
+      uint32_t offset = addr & 0x01FFFFFF;
+      if (offset < rom.size() - 3)
+        return *(uint32_t *)&ptr[offset & ~3];
+      return 0;
+    }
+    default:
+      break;
+    }
   }
-  // 快速路径：IWRAM
-  if ((addr >> 24) == 0x03) {
-    return *(uint32_t *)&wram_chip[addr & 0x7FFC];
-  }
-  // 快速路径：EWRAM
-  if ((addr >> 24) == 0x02) {
-    return *(uint32_t *)&wram_board[addr & 0x3FFFC];
-  }
-  // 快速路径：ROM (0x08)
-  if ((addr >> 24) == 0x08) {
-    if ((addr & 0x00FFFFFF) < rom.size() - 3)
-      return *(uint32_t *)&rom[(addr & 0x00FFFFFF) & ~3];
-    return 0; // Out of bounds ROM read
-  }
+
   return read16(addr) | (read16(addr + 2) << 16);
 }
 
@@ -151,11 +216,7 @@ void Bus::write16(uint32_t addr, uint16_t value) {
       apu->write16(addr, value);
     }
     if (offset >= 0xB0 && offset <= 0xDF) {
-      static int dmaWriteLog = 0;
-      if (dmaWriteLog++ < 100) {
-        printf("BUS DMA WRITE16: addr=%08X offset=%04X value=%04X\n", addr,
-               offset, value);
-      }
+      // DMA register write (no debug log)
     }
     if (offset == 0x202) {
       // REG_IF is acknowledge-by-writing-1

@@ -100,6 +100,11 @@ private:
   void executeARM(uint32_t opcode);
   void executeThumb(uint16_t opcode); // Later
 
+  // Fast CPU Decode Lookup Tables
+  typedef void (CPU::*ArithHandler)(uint32_t);
+  ArithHandler armTable[4096]; // Top 12 bits of typical ARM opcode
+  void initDecodeTables();
+
   bool checkCondition(uint32_t cond);
 
   uint32_t barrelShifter(uint32_t val, uint8_t shiftType, uint8_t shiftAmount,

@@ -6,7 +6,10 @@
 
 namespace Core {
 
-CPU::CPU(std::shared_ptr<Bus> bus) : bus(bus) { reset(); }
+CPU::CPU(std::shared_ptr<Bus> bus) : bus(bus) {
+  initDecodeTables();
+  reset();
+}
 
 CPU::~CPU() {}
 
@@ -55,89 +58,6 @@ void CPU::step() {
 
   // 当前要执行的指令永远在 pipeline[0]
   uint32_t opcode = pipeline[0];
-
-  // 计算当前指令的真实 PC 地址
-  uint32_t currentPC =
-      (cpsr & 0x20) ? (registers[15] - 4) : (registers[15] - 8);
-  static bool traceActive = false;
-  static uint32_t lastPC = 0;
-
-  static uint64_t stepCount = 0;
-  if (stepCount++ % 2000000 == 0) {
-    fprintf(stderr, "CPU AT: PC=%08X CPSR=%08X Mode=%s stepCount=%llu\n",
-            currentPC, cpsr, (cpsr & 0x20) ? "Thumb" : "ARM", stepCount);
-  }
-
-  static uint32_t historyPC[256];
-  static uint32_t historyOp[256];
-  static uint32_t historySP[256];
-  static uint32_t historyLR[256];
-  static uint32_t historyR0[256];
-  static uint32_t historyR1[256];
-  static uint32_t historyR2[256];
-  static int historyIdx = 0;
-  historyPC[historyIdx] = currentPC;
-  historyOp[historyIdx] = opcode;
-  historySP[historyIdx] = registers[13];
-  historyLR[historyIdx] = registers[14];
-  historyR0[historyIdx] = registers[0];
-  historyR1[historyIdx] = registers[1];
-  historyR2[historyIdx] = registers[2];
-  historyIdx = (historyIdx + 1) % 256;
-
-  if (!traceActive && lastPC >= 0x08000000 && currentPC < 0x01000000) {
-    traceActive = true;
-    printf("JUMP TO BIOS DETECTED! Last PC=%08X, Current PC=%08X\n", lastPC,
-           currentPC);
-    printf("Instruction History before crash:\n");
-    for (int i = 0; i < 256; i++) {
-      int idx = (historyIdx + i) % 256;
-      printf(
-          "Hist[%d]: PC=%08X Op=%08X SP=%08X LR=%08X R0=%08X R1=%08X R2=%08X\n",
-          i, historyPC[idx], historyOp[idx], historySP[idx], historyLR[idx],
-          historyR0[idx], historyR1[idx], historyR2[idx]);
-    }
-  }
-
-  if (traceActive) {
-    static int traceCount = 0;
-    if (traceCount++ < 50) {
-      printf("BIOS TRACE %s PC=%08X Op=%08X R0=%08X R1=%08X CPSR=%08X\n",
-             (cpsr & 0x20) ? "Thumb" : "ARM", currentPC, opcode, registers[0],
-             registers[1], cpsr);
-    }
-  }
-  lastPC = currentPC;
-
-  static uint64_t totalInsns = 0;
-  totalInsns++;
-  if (totalInsns % 1000000 == 0) {
-    printf("CPU Heartbeat: %s PC=%08X CPSR=%08X Op=%08X\n",
-           (cpsr & 0x20) ? "Thumb" : "ARM", currentPC, cpsr, opcode);
-  }
-
-  if (currentPC >= 0x07000000 && currentPC < 0x08000000) {
-    static int weirdPcLogCount = 0;
-    if (weirdPcLogCount++ < 100) {
-      printf("WEIRD PC %08X Op=%08X R0=%08X R1=%08X CPSR=%08X\n", currentPC,
-             opcode, registers[0], registers[1], cpsr);
-    }
-  }
-
-  static int romBootTrace = 0;
-  if (currentPC == 0x08000000)
-    romBootTrace = 50;
-  if (romBootTrace > 0) {
-    romBootTrace--;
-    printf("BOOT TRACE: %s PC=%08X Op=%08X R0=%08X R1=%08X CPSR=%08X\n",
-           (cpsr & 0x20) ? "Thumb" : "ARM", currentPC, opcode, registers[0],
-           registers[1], cpsr);
-  }
-
-  if (Debugger::getInstance().isEnabled()) {
-    Debugger::getInstance().logInstruction(currentPC, opcode, registers.data(),
-                                           cpsr, (cpsr & 0x20));
-  }
 
   pipelineFlushed = false;
 
@@ -228,30 +148,11 @@ void CPU::executeARM(uint32_t opcode) {
   if (!checkCondition(opcode >> 28))
     return;
 
-  // ARM 指令解码 - 按优先级排列
-  // 参考 ARM7TDMI 数据手册的指令编码表
-
-  // SWI? Cond 1111 ... -> Bits 24-27 = 1111
-  if (((opcode >> 24) & 0xF) == 0xF) {
-    opSWI(opcode);
-    return;
-  }
-
-  // Branch? 101L -> Bits 25-27 = 101
-  if (((opcode >> 25) & 0x7) == 0x5) {
-    opBranch(opcode);
-    return;
-  }
-
-  // Block Data Transfer? 100 -> Bits 25-27 = 100
-  if (((opcode >> 25) & 0x7) == 0x4) {
-    opBlockDataTransfer(opcode);
-    return;
-  }
-
-  // Load/Store? 01x -> Bits 26-27 = 01
-  if (((opcode >> 26) & 0x3) == 0x1) {
-    opLoadStore(opcode);
+  // Look up instruction in precomputed table (Bits 27-16)
+  uint32_t index = (opcode >> 16) & 0xFFF;
+  ArithHandler handler = armTable[index];
+  if (handler) {
+    (this->*handler)(opcode);
     return;
   }
 
@@ -381,6 +282,35 @@ void CPU::executeARM(uint32_t opcode) {
   }
 
   Debugger::getInstance().logUnknownOpcode(registers[15] - 8, opcode, false);
+}
+
+void CPU::initDecodeTables() {
+  for (int i = 0; i < 4096; i++) {
+    armTable[i] = nullptr;
+  }
+
+  // Create mapping based on top 12 bits (opcode >> 16 & 0xFFF)
+  for (int i = 0; i < 4096; i++) {
+    uint32_t op = i << 16;
+
+    // Bits 27-24 (i >> 8)
+    int type = (i >> 8) & 0xF;
+
+    if (type == 0xF) {
+      armTable[i] = &CPU::opSWI;
+    } else if ((type & 0xE) == 0xA) { // 101x
+      armTable[i] = &CPU::opBranch;
+    } else if ((type & 0xE) == 0x8) { // 100x
+      armTable[i] = &CPU::opBlockDataTransfer;
+    } else if ((type & 0xC) == 0x4) { // 01xx
+      armTable[i] = &CPU::opLoadStore;
+    } else {
+      // Catch-all for data processing and sub-instructions is handled inside
+      // executeARM due to Bit 4 and 7 specific checks which need lower 16 bits.
+      // We will let them fall through the table check for now, or we can map
+      // them to a fallback handler.
+    }
+  }
 }
 
 void CPU::executeThumb(uint16_t opcode) {
@@ -1772,7 +1702,7 @@ void CPU::opSWI(uint32_t opcode) {
     swi = (opcode >> 16) & 0xFF;
   }
 
-  printf("SWI Called: %02X PC=%08X\n", swi, registers[15]);
+  // SWI handler (no debug log)
 
   // 有真实 BIOS 时，走硬件 SWI 路径（跳转到 0x08 执行 BIOS 代码）
   if (hasBIOS_) {

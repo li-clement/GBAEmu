@@ -1,7 +1,7 @@
 #import "MetalView.h"
-#include "APU.h"
-#include "GBA.h"
-#include "IORegisters.h"
+#include "../core/APU.h"
+#include "../core/GBA.h"
+#include "../core/IORegisters.h"
 #import <AudioToolbox/AudioToolbox.h>
 #import <MetalKit/MetalKit.h>
 #include <chrono>
@@ -14,42 +14,6 @@ typedef struct {
   vector_float2 position;
   vector_float2 textureCoordinate;
 } Vertex;
-
-// Shader source code embedded as string
-static NSString *const kShaderSource =
-    @""
-     "#include <metal_stdlib>\n"
-     "using namespace metal;\n"
-     "\n"
-     "struct VertexIn {\n"
-     "    float2 position;\n"
-     "    float2 textureCoordinate;\n"
-     "};\n"
-     "\n"
-     "struct VertexOut {\n"
-     "    float4 position [[ position ]];\n"
-     "    float2 textureCoordinate;\n"
-     "};\n"
-     "\n"
-     "vertex VertexOut vertexShader(uint vertexID [[ vertex_id ]],\n"
-     "                              constant VertexIn *vertices [[ buffer(0) "
-     "]]) {\n"
-     "    VertexOut out;\n"
-     "    out.position = float4(vertices[vertexID].position, 0.0, 1.0);\n"
-     "    out.textureCoordinate = vertices[vertexID].textureCoordinate;\n"
-     "    return out;\n"
-     "}\n"
-     "\n"
-     "fragment float4 fragmentShader(VertexOut in [[ stage_in ]],\n"
-     "                               texture2d<float> colorTexture [[ "
-     "texture(0) ]]) {\n"
-     "    constexpr sampler textureSampler (mag_filter::nearest,\n"
-     "                                      min_filter::nearest);\n"
-     "    return colorTexture.sample(textureSampler, in.textureCoordinate);\n"
-     "}\n";
-
-// Triple Buffering
-static const int kMaxInflightBuffers = 3;
 
 @implementation MetalView {
   id<MTLCommandQueue> _commandQueue;
@@ -80,7 +44,13 @@ static const int kMaxInflightBuffers = 3;
 
   NSLock *_displayLock; // Protects _readyBuffer access
   NSLock *_coreLock;    // Protects _gba access
-  bool _newFrameReady;  // Signals drawInMTKView to replaceRegion
+  NSCondition *_audioCondition; // Replaces sleep for fine-grain sync
+  id<MTLComputePipelineState> _computePipelineState;
+  id<MTLBuffer> _vramBuffer;
+  id<MTLBuffer> _palBuffer;
+  id<MTLBuffer> _oamBuffer;
+  id<MTLBuffer> _ioRegsBuffer;
+  bool _newFrameReady;
 }
 
 - (instancetype)initWithFrame:(CGRect)frame {
@@ -98,13 +68,15 @@ static const int kMaxInflightBuffers = 3;
     _commandQueue = [self.device newCommandQueue];
 
     _coreLock = [[NSLock alloc] init];
+    _audioCondition = [[NSCondition alloc] init];
+
+    _gba = new Core::GBA();
 
     [self buildResources];
     [self buildPipeline];
 
-    _gba = new Core::GBA();
-
     // --- 从 rom 目录加载 BIOS 与 ROM ---
+
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *execPath = [[NSProcessInfo processInfo] arguments][0];
     NSString *projectRoot = [[execPath stringByDeletingLastPathComponent]
@@ -197,6 +169,28 @@ static const int kMaxInflightBuffers = 3;
 
     _gba->reset();
 
+    // Setup MTLBuffers for GPU PPU rendering.
+    // NOTE: newBufferWithBytesNoCopy requires page-aligned memory which
+    // std::vector does NOT guarantee. Use regular newBufferWithBytes instead.
+    // On Apple Silicon UMA the copy overhead is negligible.
+    auto &bus = _gba->getBus();
+    _vramBuffer =
+        [self.device newBufferWithBytes:(void *)bus.getVRAMPointer()
+                                 length:96 * 1024
+                                options:MTLResourceStorageModeShared];
+    _palBuffer =
+        [self.device newBufferWithBytes:(void *)bus.getPalettePointer()
+                                 length:1024
+                                options:MTLResourceStorageModeShared];
+    _oamBuffer =
+        [self.device newBufferWithBytes:(void *)bus.getOAMPointer()
+                                 length:1024
+                                options:MTLResourceStorageModeShared];
+    _ioRegsBuffer =
+        [self.device newBufferWithBytes:(void *)bus.getIORegsPointer()
+                                 length:4096 // 0x1000 IO region
+                                options:MTLResourceStorageModeShared];
+
     // 所有初始化完成后才启动仿真循环 (避免数据竞争)
     _running = true;
     [self startEmulationLoop];
@@ -229,6 +223,9 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
     memcpy(buffer->mAudioData, _audioRingBuffer.data(), availableBytes);
     _audioRingBuffer.clear();
     buffer->mAudioDataByteSize = (UInt32)bytesToCopy;
+    
+    // We drained the buffer, wake up the emulation thread!
+    [_audioCondition broadcast];
 
     static int starvLog = 0;
     if (starvLog++ % 60 == 0) {
@@ -241,6 +238,9 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
                            _audioRingBuffer.begin() +
                                (bytesToCopy / sizeof(int16_t)));
     buffer->mAudioDataByteSize = (UInt32)bytesToCopy;
+    
+    // Signal that space might be freed
+    [_audioCondition broadcast];
   }
 
   [self->_audioLock unlock];
@@ -292,32 +292,25 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
                                            length:sizeof(quadVertices)
                                           options:MTLResourceStorageModeShared];
 
-  // 2. 创建 Triple Buffering 资源
-  NSUInteger bytesPerRow = 1024;
-  NSUInteger bufferSize = bytesPerRow * 160;
-
   // Create the single GPU texture
   MTLTextureDescriptor *textureDescriptor = [MTLTextureDescriptor
       texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                                    width:240
                                   height:160
                                mipmapped:NO];
-  textureDescriptor.usage = MTLTextureUsageShaderRead;
-  // Managed storage mode ensures CPU -> GPU copy works synchronously via
-  // replaceRegion
-  textureDescriptor.storageMode = MTLStorageModeManaged;
+  textureDescriptor.usage =
+      MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+  // Use Shared so Compute Pipeline can write to it on UMA, and we skip CPU
+  // copies completely
+  textureDescriptor.storageMode = MTLStorageModeShared;
 
   _displayTexture = [self.device newTextureWithDescriptor:textureDescriptor];
-  _cpuBuffer.resize(240 * 160, 0);
-  _readyBuffer.resize(240 * 160, 0);
-  _newFrameReady = false;
 
   _emulationQueue =
       dispatch_queue_create("com.gbaemu.core", DISPATCH_QUEUE_SERIAL);
   _displayLock = [[NSLock alloc] init];
 
   [self setupAudio];
-  // _running 和 startEmulationLoop 已移到 initWithFrame 末尾
 }
 
 - (void)loadROM:(NSData *)romData {
@@ -336,17 +329,44 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
 }
 
 - (void)buildPipeline {
-  NSError *error;
+  NSError *error = nil;
 
-  // 使用运行时编译
-  id<MTLLibrary> library = [self.device newLibraryWithSource:kShaderSource
-                                                     options:nil
+  // 使用当前可执行文件同目录下或源码目录下的 Shaders.metal
+  NSString *execPath = [[NSProcessInfo processInfo] arguments][0];
+  NSString *projectRoot = [[execPath stringByDeletingLastPathComponent]
+      stringByDeletingLastPathComponent];
+  NSString *srcDir =
+      [projectRoot stringByAppendingPathComponent:@"src/platform/shaders"];
+  NSString *shaderPath =
+      [srcDir stringByAppendingPathComponent:@"Shaders.metal"];
+
+  NSFileManager *fm = [NSFileManager defaultManager];
+  if (![fm fileExistsAtPath:shaderPath]) {
+    NSString *cwd = [fm currentDirectoryPath];
+    shaderPath = [cwd
+        stringByAppendingPathComponent:@"src/platform/shaders/Shaders.metal"];
+  }
+
+  NSString *shaderSource =
+      [NSString stringWithContentsOfFile:shaderPath
+                                encoding:NSUTF8StringEncoding
+                                   error:&error];
+  if (!shaderSource) {
+    NSLog(@"Could not load Shaders.metal from %@: %@", shaderPath, error);
+    return;
+  }
+
+  MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+  options.fastMathEnabled = YES;
+  id<MTLLibrary> library = [self.device newLibraryWithSource:shaderSource
+                                                     options:options
                                                        error:&error];
   if (!library) {
     NSLog(@"Error compiling shaders: %@", error);
     return;
   }
 
+  // View pipeline
   id<MTLFunction> vertexFunction =
       [library newFunctionWithName:@"vertexShader"];
   id<MTLFunction> fragmentFunction =
@@ -365,10 +385,20 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
   if (!_pipelineState) {
     NSLog(@"Failed to create pipeline state: %@", error);
   }
+
+  // Compute Pipeline for PPU
+  id<MTLFunction> computeFunction =
+      [library newFunctionWithName:@"ppg_compute_shader"];
+  _computePipelineState =
+      [self.device newComputePipelineStateWithFunction:computeFunction
+                                                 error:&error];
+  if (!_computePipelineState) {
+    NSLog(@"Failed to create compute pipeline state: %@", error);
+  }
 }
 
 - (void)startEmulationLoop {
-  __weak MetalView *weakSelf = self;
+  __unsafe_unretained MetalView *weakSelf = self;
   dispatch_async(_emulationQueue, ^{
     while (true) {
       MetalView *strongSelf = weakSelf;
@@ -376,55 +406,34 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
         break;
 
       // Run Emulation (Produces 1 frame)
+      // 只在 stepFrame 期间持锁，之后立即释放让渲染线程可以 memcpy VRAM
       [strongSelf->_coreLock lock];
-      strongSelf->_gba->stepFrame(strongSelf->_cpuBuffer.data(), 1024);
+      strongSelf->_gba->stepFrame(nullptr, 1024);
 
-      // Push Audio and Sync Speed strictly to 44100Hz playback rate!
-      {
-        auto &audioOut = strongSelf->_gba->getAPU().getBuffer();
-
-        // Audio Sync Throttle: Block if buffer is > 4096 samples (approx. 90ms
-        // of lag!)
-        while (true) {
-          if (!strongSelf || !strongSelf->_running)
-            break;
-          bool full = false;
-          [strongSelf->_audioLock lock];
-          if (strongSelf->_audioRingBuffer.size() > 4096) {
-            full = true;
-          }
-          [strongSelf->_audioLock unlock];
-
-          if (!full)
-            break;
-          std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-
-        [strongSelf->_audioLock lock];
-        strongSelf->_audioRingBuffer.insert(strongSelf->_audioRingBuffer.end(),
-                                            audioOut.begin(), audioOut.end());
-        [strongSelf->_audioLock unlock];
-
-        static int mixLog = 0;
-        if (mixLog++ % 60 == 0) {
-          int nonZeroCount = 0;
-          for (auto s : audioOut)
-            if (s != 0)
-              nonZeroCount++;
-          NSLog(@"AUDIO MIX: Pushed %zu samples. Non-zero: %d. Ring Buffer "
-                @"size: %zu",
-                audioOut.size(), nonZeroCount,
-                strongSelf->_audioRingBuffer.size());
-        }
-
-        strongSelf->_gba->getAPU().clearBuffer();
-      }
+      // 快速拷贝 audio 数据出来，然后立刻释放 coreLock
+      auto &audioOut = strongSelf->_gba->getAPU().getBuffer();
+      std::vector<int16_t> audioCopy(audioOut.begin(), audioOut.end());
+      strongSelf->_gba->getAPU().clearBuffer();
       [strongSelf->_coreLock unlock];
 
-      // Publish new frame to readyBuffer
+      // 音频同步在 coreLock 之外进行，不阻塞渲染线程
+      {
+        [strongSelf->_audioCondition lock];
+        [strongSelf->_audioLock lock];
+        while (strongSelf->_running && strongSelf->_audioRingBuffer.size() > 4096) {
+          [strongSelf->_audioLock unlock];
+          [strongSelf->_audioCondition wait];
+          [strongSelf->_audioLock lock];
+        }
+        
+        strongSelf->_audioRingBuffer.insert(strongSelf->_audioRingBuffer.end(),
+                                            audioCopy.begin(), audioCopy.end());
+        [strongSelf->_audioLock unlock];
+        [strongSelf->_audioCondition unlock];
+      }
+
+      // Mark that logic has passed VBLANK, safe to encode GPU pass
       [strongSelf->_displayLock lock];
-      memcpy(strongSelf->_readyBuffer.data(), strongSelf->_cpuBuffer.data(),
-             240 * 160 * 4);
       strongSelf->_newFrameReady = true;
       [strongSelf->_displayLock unlock];
     }
@@ -433,11 +442,6 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
 
 // Logic is now in background thread
 - (void)updateGameLogic {
-  // Scrolling logic moved to GBA core or input handling?
-  // Left empty for now as stepFrame handles the core.
-  // We could handle other main-thread logic here if needed.
-
-  // Test Scrolling: Scroll diagonally
   static int scrollX = 0;
   static int scrollY = 0;
   static int scrollFrame = 0;
@@ -448,62 +452,59 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
     _gba->getBus().write16(0x04000000 + 0x10, scrollX); // BG0HOFS
     _gba->getBus().write16(0x04000000 + 0x12, scrollY); // BG0VOFS
   }
-
-  // Visual Debug: Show R0 value as red intensity
-  // MOV R0, #42 -> R0 should be 42
-  // ADD R2, R0, R1 -> 42+10 = 52
-  // Let's print registers occasionally
-  static int frameCount = 0;
-  frameCount++;
-  if (frameCount < 600 || frameCount % 60 == 0) {
-    uint32_t r0 = _gba->getCPU().getRegister(0);
-    uint32_t r1 = _gba->getCPU().getRegister(1);
-    uint32_t r2 = _gba->getCPU().getRegister(2);
-    uint32_t pc = _gba->getCPU().getRegister(15);
-
-    FILE *f = fopen("log.txt", "a");
-    if (f) {
-      uint32_t keyinput = _gba->getBus().read16(0x04000130);
-      static uint32_t lastKeyInput = 0xFFFF;
-      if (keyinput != lastKeyInput) {
-        fprintf(f, "[Input] KEYINPUT Changed: %04X\n", keyinput);
-        lastKeyInput = keyinput;
-      }
-
-      // Only log CPU state occasionally to reduce spam
-      if (frameCount % 60 == 0) {
-        fprintf(f, "[Frame %d] CPU PC=%08X R0=%d R1=%d R2=%d\n", frameCount, pc,
-                r0, r1, r2);
-      }
-      fclose(f);
-    }
-  }
 }
 
 - (void)drawInMTKView:(MTKView *)view {
-  if (!_displayTexture)
+  if (!_displayTexture || !_computePipelineState || !_vramBuffer)
     return;
 
-  bool uploadNeeded = false;
+  bool shouldDraw = false;
   [self->_displayLock lock];
   if (self->_newFrameReady) {
-    [self->_displayTexture replaceRegion:MTLRegionMake2D(0, 0, 240, 160)
-                             mipmapLevel:0
-                               withBytes:self->_readyBuffer.data()
-                             bytesPerRow:1024];
+    shouldDraw = true;
     self->_newFrameReady = false;
   }
   [self->_displayLock unlock];
 
-  id<MTLCommandBuffer> commandBuffer = [_commandQueue commandBuffer];
-  commandBuffer.label = @"MyCommand";
+  if (!shouldDraw)
+    return; // Wait for core emulation to finish a frame
 
+  id<MTLCommandBuffer> commandBuffer = [_commandQueue commandBuffer];
+  commandBuffer.label = @"GBA Render Command";
+
+  // Dispatch Compute Shader to paint VRAM to _displayTexture
+  id<MTLComputeCommandEncoder> computeEncoder =
+      [commandBuffer computeCommandEncoder];
+  [computeEncoder setComputePipelineState:_computePipelineState];
+  [computeEncoder setTexture:_displayTexture atIndex:0];
+  
+  // 每帧同步最新的 VRAM/PAL/OAM/IO 数据到 Metal 缓冲区
+  // (因为使用 newBufferWithBytes 而非零拷贝，GPU 不会自动看到 CPU 写入)
+  [self->_coreLock lock];
+  if (self->_gba) {
+    auto &bus = self->_gba->getBus();
+    // 同步 VRAM (96KB) 到 Metal Buffer
+    memcpy(_vramBuffer.contents, bus.getVRAMPointer(), 96 * 1024);
+    [computeEncoder setBuffer:_vramBuffer offset:0 atIndex:0];
+    [computeEncoder setBytes:bus.getPalettePointer() length:1024 atIndex:1];
+    [computeEncoder setBytes:bus.getOAMPointer()     length:1024 atIndex:2];
+    [computeEncoder setBytes:bus.getIORegsPointer()  length:1024 atIndex:3];
+  }
+  [self->_coreLock unlock];
+
+  MTLSize threadsPerGrid = MTLSizeMake(240, 160, 1);
+  MTLSize threadsPerThreadgroup = MTLSizeMake(16, 16, 1);
+  [computeEncoder dispatchThreads:threadsPerGrid
+            threadsPerThreadgroup:threadsPerThreadgroup];
+  [computeEncoder endEncoding];
+
+  // Display Phase
   MTLRenderPassDescriptor *renderPassDescriptor =
       view.currentRenderPassDescriptor;
   if (renderPassDescriptor != nil) {
     id<MTLRenderCommandEncoder> renderEncoder =
         [commandBuffer renderCommandEncoderWithDescriptor:renderPassDescriptor];
-    renderEncoder.label = @"MyRenderEncoder";
+    renderEncoder.label = @"Screen Rectangle Pass";
 
     [renderEncoder
         setViewport:(MTLViewport){0.0, 0.0, (double)self.drawableSize.width,
@@ -519,11 +520,6 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
 
     [renderEncoder endEncoding];
     [commandBuffer presentDrawable:view.currentDrawable];
-
-    static int logCount = 0;
-    if (logCount++ % 60 == 0) {
-      NSLog(@"Frame Presented");
-    }
   }
   [commandBuffer commit];
 }

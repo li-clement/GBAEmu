@@ -38,7 +38,20 @@ public:
   void loadBIOS(const std::vector<uint8_t> &data);
   void loadROM(const std::vector<uint8_t> &data);
 
+  // Direct memory access for PPU rendering optimization
+  const uint8_t* getPalettePointer() const { return palette.data(); }
+  const uint8_t* getVRAMPointer() const { return vram.data(); }
+  const uint8_t* getOAMPointer() const { return oam.data(); }
+  const uint8_t* getIORegsPointer() const { return io_regs.data(); }
+
 private:
+  void initMemoryMap();
+
+  // Fast translation table for Memory Map:
+  // We use the top 8 bits (addr >> 24) to find the page pointer.
+  // GBA memory is mapped from 0x00 to 0x0E max.
+  uint8_t* memory_map[256];
+  
   std::vector<uint8_t> bios; // 16KB BIOS
   bool vectorTableWritable_ = true; // 无 BIOS 时可写 0x00-0x3F；有 BIOS 时只读
   std::vector<uint8_t> wram_board; // 256KB On-board WRAM

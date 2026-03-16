@@ -1,50 +1,68 @@
 # M1 GBA 模拟器
 
-一款专为 Apple Silicon (M1/M2/M3) Mac 打造的高性能 Game Boy Advance 模拟器，采用 C++ 与 Objective-C++ 混合开发。该项目依托 Apple 的 **Metal** 图形 API 与统一内存架构 (UMA)，旨在实现零拷贝的低延迟渲染与极致性能。
+一款专为 Apple Silicon (M1/M2/M3) Mac 打造的高性能 Game Boy Advance 模拟器，采用 C++ 与 Objective-C++ 混合开发。该项目依托 Apple 的 **Metal** 图形 API 与统一内存架构 (UMA)，旨在实现低延迟渲染与极致性能。
 
-## 当前能力与进展
+## 核心特性
 
-模拟器目前已建立起完整的核心渲染管线与运行框架，并具备以下主要子系统的模拟能力：
+### 🔧 ARM7TDMI CPU 引擎
+- 完整的 ARM 与 Thumb 双指令集执行支持
+- **预解码查找表 (LUT)** 加速指令分发，按 opcode 高 12 位直接映射到处理函数，消除热路径分支预测失败
+- 高级模拟 (HLE) BIOS 中断拦截，无需真实 `.bin` 固件即可引导大多数游戏
 
-- **ARM7TDMI 核心**: 已实现 ARM 与 Thumb 指令集执行支持，涵盖基础的指令读取、解码和处理。
-- **Metal 硬件渲染**: 使用 macOS 原生的 MetalView 构建显示前端，通过零拷贝的方式高效实现从 CPU 内存到 GPU 纹理的像素转换。
-- **自定义环境 BIOS (HLE)**: 嵌入了自行开发的高级模拟 (HLE) BIOS 中断处理拦截，能够直接代理常见的 SWI 软中断，无需依赖真实系统的 `.bin` 固件即可引导执行多数游戏程序。
-- **内部总线与寄存器映射**: 搭建了底层内存交互总线 (Bus)，并对 I/O 硬件交互、VBlank/HBlank 垂直与水平空闲中断以及硬件定时器 (Timer) 进行了基础映射与触发实现。
-- **声音系统基础**: 初步框架支撑了 DirectSound 的缓冲区流转，并将音频回放链路对接至 macOS CoreAudio API。
+### ⚡ 高性能内存总线
+- **O(1) 页表寻址**：256 项指针数组直接映射 GBA 内存区域 (BIOS/WRAM/VRAM/ROM 等)，取代传统 if-else 链
+- 完整的 DMA 传输引擎 (4 通道)，支持 VBlank/HBlank/Sound 触发模式
+- IO 寄存器副作用处理与中断标志位的正确 ACK 逻辑
 
-## 待优化与开发项目
+### 🎨 Metal GPU 渲染管线
+- macOS 原生 MetalView 显示前端，Compute Shader 直接在 GPU 上完成 GBA PPU 像素解码
+- 支持 Mode 0/1/2 平铺背景与 Mode 3/4/5 位图模式
+- Sprite (OBJ) 渲染与图层优先级管理
+- 仿真线程与渲染线程解耦，通过精细化锁管理避免帧率抖动
 
-项目正在积极演进中，未来的架构升级与功能重点涵盖：
+### 🔊 DirectSound 音频系统
+- FIFO A/B 双通道 DirectSound 流式播放
+- 矩形波方波发声器基础支持
+- CoreAudio AudioQueue 输出，44.1kHz 采样率
+- **NSCondition 条件变量** 精准同步音频缓冲，替代低精度的 sleep 忙等
 
-- **加强 PPU 图形引擎精度**: 进一步完善各类 Background Mode 下的平铺背景与仿射变换效果，并修复 Sprite 显示优先级、图层混色 (Alpha Blending) 和遮罩窗口 (Windows) 渲染。
-- **完善 DMA 与时钟同步**: 增加更苛刻的直接内存访问 (DMA) 触发条件校准，优化整个主板周期的时间同步准确度。
-- **老旧 APU 音源复刻**: 加入 Game Boy 传统的矩形波、波形发声和噪音频道模拟，提升整体声音环境播放质感及避免偶尔爆音。
-- **强化物理存储支持**: 引入完整的卡带内部存档处理 (SRAM、Flash 和 EEPROM 芯片协议)，支持游戏存档数据的安全本地读写。
-- **交互与用户体验**: 加入游戏的手柄按键自定义输入绑定支持、用户图形化配置界面，以及允许中断和恢复的即时存档 (Save States) 系统。
+### 🏗️ 编译优化
+- `-O3` 最高优化级别 + `-flto` 链接时优化 (LTO)，支持跨编译单元内联
+- `-mcpu=apple-m1` 启用 Apple Silicon 原生指令集优化
+- `-arch arm64` 原生 ARM64 编译
 
 ## 编译与运行
 
-1. **载入 ROM 游戏**: 将个人的 `.gba` 游戏本体放置于项目根目录所创建的 `rom/` 文件夹中。
-2. **在终端执行构建**:
+1. **载入 ROM 游戏**: 将 `.gba` 游戏文件放置于 `rom/` 文件夹中。
+2. **编译并运行**:
    ```bash
-   make && ./bin/GBAEmu "rom/YourGame.gba"
+   make && ./bin/GBAEmu
    ```
-   *(亦可仅执行 `make` 编译成功后运行应用程序即可。在模拟器运行时，您可以通过 macOS 的系统屏幕顶部菜单栏，点击 **File → Open ROM...** 来动态加载并切换游戏进程。)*
+   运行后可通过菜单栏 **File → Open ROM...** 动态加载游戏。
 
 ## 键盘控制
 
-现支持的模拟器默认键位映射方案为：
+| GBA 按键 | 键盘映射 |
+|----------|----------|
+| 方向键 (D-Pad) | ← ↑ → ↓ |
+| A | `Z` |
+| B | `X` |
+| L 肩键 | `A` |
+| R 肩键 | `S` |
+| Start | `Enter` |
+| Select | `Backspace` |
 
-- **方向键 (D-Pad)**: 键盘方向键 (上, 下, 左, 右)
-- **A 键**: `Z`
-- **B 键**: `X`
-- **L 肩键**: `A`
-- **R 肩键**: `S`
-- **Start (开始)**: `Enter` (回车)
-- **Select (选择)**: `Backspace` (退格)
+## 目录结构
 
-## 目录架构参考
+- `src/core/` — 核心模拟引擎 (CPU, PPU, APU, Bus, Timer, DMA)
+- `src/platform/` — macOS 平台集成 (MetalView, CoreAudio, Objective-C++ 桥接)
+- `src/platform/shaders/` — Metal Compute/Render Shader
+- `src/test/` — 单元测试 (ARM/Thumb 指令、LZ77 解压)
 
-- `src/core/`: 独立抽象的核心系统模拟引擎代码 (CPU, PPU通道, APU音频, 总线, 时钟和 DMA模块)。
-- `src/platform/`: Apple 平台集成相关业务逻辑 (Objective-C++ 视窗桥接封装, MetalView 图形驱动, 以及原生系统音频接口)。
-- `src/test/`: 包含部分处理器操作码功能覆盖的单元测试，以及 LZ77 等组件的算法测试集。
+## 待完善
+
+- PPU 图层混合 (Alpha Blending) 与窗口遮罩 (Window)
+- 仿射变换精度提升 (Mode 1/2 旋转缩放)
+- GB 传统音源 (波形/噪音通道) 完整复刻
+- 卡带存档支持 (SRAM / Flash / EEPROM)
+- 手柄输入绑定与即时存档 (Save States)
