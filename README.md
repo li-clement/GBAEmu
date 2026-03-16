@@ -64,5 +64,4 @@
 - PPU 图层混合 (Alpha Blending) 与窗口遮罩 (Window)
 - 仿射变换精度提升 (Mode 1/2 旋转缩放)
 - GB 传统音源 (波形/噪音通道) 完整复刻
-- 卡带存档支持 (SRAM / Flash / EEPROM)
 - 手柄输入绑定与即时存档 (Save States)
