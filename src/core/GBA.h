@@ -1,10 +1,12 @@
 #pragma once
 
 #include "APU.h"
+#include "Backup.h"
 #include "Bus.h"
 #include "CPU.h"
 #include "PPU.h"
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace Core {
@@ -25,6 +27,11 @@ public:
   void loadBIOS(const std::vector<uint8_t> &data);
   void loadROM(const std::vector<uint8_t> &data);
 
+  // 存档持久化
+  void setROMPath(const std::string &path);
+  void loadSave();   // 从 .sav 文件加载存档
+  void saveSave();   // 将存档写入 .sav 文件
+
   // Debugging
   const CPU &getCPU() const { return *cpu; }
   Bus &getBus() { return *bus; }
@@ -36,6 +43,9 @@ private:
   std::unique_ptr<CPU> cpu;
   std::unique_ptr<PPU> ppu;
   std::unique_ptr<APU> apu;
+  std::unique_ptr<Backup> backup;
+
+  std::string romPath_;  // ROM 文件路径（用于推导 .sav 路径）
 
   // Timers
   struct Timer {

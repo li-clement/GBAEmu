@@ -39,6 +39,11 @@
   [self setupMenu];
 }
 
+- (void)applicationWillTerminate:(NSNotification *)notification {
+  // 应用退出前保存存档
+  [self.metalView saveSave];
+}
+
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:
     (NSApplication *)sender {
   return YES;
@@ -76,7 +81,7 @@
       NSURL *url = [panel URL];
       NSData *data = [NSData dataWithContentsOfURL:url];
       if (data) {
-        [self.metalView loadROM:data];
+        [self.metalView loadROM:data fromPath:[url path]];
         [self.window
             setTitle:[NSString stringWithFormat:@"M1 GBA Emulator - %@",
                                                 [url lastPathComponent]]];
@@ -104,7 +109,7 @@ int main(int argc, const char *argv[]) {
       dispatch_async(dispatch_get_main_queue(), ^{
         NSData *data = [NSData dataWithContentsOfFile:path];
         if (data) {
-          [delegate.metalView loadROM:data];
+          [delegate.metalView loadROM:data fromPath:path];
           [delegate.window
               setTitle:[NSString stringWithFormat:@"M1 GBA Emulator - %@",
                                                   [path lastPathComponent]]];

@@ -1,5 +1,6 @@
 #include "GBA.h"
 #include "APU.h"
+#include "Backup.h"
 #include "Debugger.h"
 #include "IORegisters.h"
 #include "Timing.h"
@@ -344,6 +345,26 @@ void GBA::loadROM(const std::vector<uint8_t> &data) {
     return;
   }
   bus->loadROM(data);
+
+  // 自动检测存档类型并创建 Backup 实例
+  auto backupType = Backup::detectFromROM(data.data(), data.size());
+  if (backupType != Backup::Type::None) {
+    backup = std::make_unique<Backup>(backupType);
+    bus->setBackup(backup.get());
+    const char *typeNames[] = {"None",       "SRAM",       "Flash64",
+                               "Flash128",   "EEPROM_512", "EEPROM_8K"};
+    printf("GBAEmu: 检测到存档类型: %s\n",
+           typeNames[(int)backupType]);
+  } else {
+    backup.reset();
+    bus->setBackup(nullptr);
+    printf("GBAEmu: 未检测到存档类型\n");
+  }
+
+  // 如果已设置 ROM 路径，尝试加载对应的 .sav 文件
+  if (!romPath_.empty() && backup) {
+    loadSave();
+  }
   // 无 BIOS 时安装完整的 HLE IRQ handler
   if (!hasBIOS) {
     cpu->setHasBIOS(false);
@@ -402,6 +423,41 @@ void GBA::loadROM(const std::vector<uint8_t> &data) {
     printf("GBAEmu: Installed HLE BIOS IRQ handler at 0x120-0x188\n");
   } else {
     cpu->setHasBIOS(true);
+  }
+}
+
+// 设置 ROM 文件路径（用于推导 .sav 路径）
+void GBA::setROMPath(const std::string &path) {
+  romPath_ = path;
+}
+
+// 从 ROM 路径推导 .sav 文件路径
+static std::string deriveSavePath(const std::string &romPath) {
+  // 将扩展名替换为 .sav
+  size_t dotPos = romPath.rfind('.');
+  if (dotPos != std::string::npos) {
+    return romPath.substr(0, dotPos) + ".sav";
+  }
+  return romPath + ".sav";
+}
+
+void GBA::loadSave() {
+  if (!backup || romPath_.empty())
+    return;
+  std::string savPath = deriveSavePath(romPath_);
+  backup->loadFromFile(savPath);
+}
+
+void GBA::saveSave() {
+  if (!backup || romPath_.empty()) {
+    return;
+  }
+  if (!backup->isDirty()) {
+    return;
+  }
+  std::string savPath = deriveSavePath(romPath_);
+  if (backup->saveToFile(savPath)) {
+    backup->clearDirty();
   }
 }
 

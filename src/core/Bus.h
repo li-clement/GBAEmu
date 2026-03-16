@@ -5,8 +5,9 @@
 
 namespace Core {
 
-class APU; // Forward decl
-class CPU; // Forward decl
+class APU;    // Forward decl
+class Backup; // Forward decl
+class CPU;    // Forward decl
 
 class Bus {
 public:
@@ -44,6 +45,13 @@ public:
   const uint8_t* getOAMPointer() const { return oam.data(); }
   const uint8_t* getIORegsPointer() const { return io_regs.data(); }
 
+  // 存档后端
+  void setBackup(Backup *b) { backup = b; }
+
+  // ROM 数据访问（供存档类型检测使用）
+  const uint8_t* getROMData() const { return rom.data(); }
+  size_t getROMSize() const { return rom.size(); }
+
 private:
   void initMemoryMap();
 
@@ -69,6 +77,7 @@ private:
   // 08000000-.......  Game ROM
 
   APU *apu = nullptr;
+  Backup *backup = nullptr;
   CPU *cpu = nullptr;
 };
 

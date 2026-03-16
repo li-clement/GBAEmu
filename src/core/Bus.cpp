@@ -1,5 +1,6 @@
 #include "Bus.h"
 #include "APU.h"
+#include "Backup.h"
 #include "CPU.h"
 #include "Debugger.h"
 
@@ -79,10 +80,22 @@ uint8_t Bus::read8(uint32_t addr) {
     return vram[addr - 0x06000000];
   } else if (addr >= 0x07000000 && addr < 0x07000400) {
     return oam[addr - 0x07000000];
-  } else if (addr >= 0x08000000) {
+  } else if (addr >= 0x08000000 && addr < 0x0E000000) {
     // ROM Mirroring handled simplistically
     if (addr - 0x08000000 < rom.size())
       return rom[addr - 0x08000000];
+    // EEPROM: 某些游戏通过 0x0DFFFF00+ 访问 EEPROM
+    if (backup && (backup->getType() == Backup::Type::EEPROM_512 ||
+                   backup->getType() == Backup::Type::EEPROM_8K)) {
+      if (addr >= 0x0D000000) {
+        return backup->eepromRead() & 0xFF;
+      }
+    }
+  } else if (addr >= 0x0E000000 && addr < 0x0E010000) {
+    // SRAM / Flash 存档区域
+    if (backup)
+      return backup->read8(addr & 0xFFFF);
+    return 0xFF; // 无存档时返回 0xFF（开路总线）
   }
 
   // Unmapped
@@ -119,9 +132,23 @@ uint16_t Bus::read16(uint32_t addr) {
     case 0x0C:
     case 0x0D: {
       uint32_t offset = addr & 0x01FFFFFF;
+      // EEPROM 拦截：0x0D 页的高地址区域
+      if (page == 0x0D && backup &&
+          (backup->getType() == Backup::Type::EEPROM_512 ||
+           backup->getType() == Backup::Type::EEPROM_8K)) {
+        return backup->eepromRead();
+      }
       if (offset < rom.size() - 1)
         return *(uint16_t *)&ptr[offset & ~1];
       return 0;
+    }
+    case 0x0E: {
+      // SRAM / Flash 存档区域（8位访问，16位读取时高字节镜像）
+      if (backup) {
+        uint8_t lo = backup->read8(addr & 0xFFFF);
+        return lo | ((uint16_t)lo << 8);
+      }
+      return 0xFFFF;
     }
     default:
       break;
@@ -164,6 +191,15 @@ uint32_t Bus::read32(uint32_t addr) {
         return *(uint32_t *)&ptr[offset & ~3];
       return 0;
     }
+    case 0x0E: {
+      // SRAM / Flash 存档区域（8位访问，32位读取时各字节镜像）
+      if (backup) {
+        uint8_t b = backup->read8(addr & 0xFFFF);
+        return b | ((uint32_t)b << 8) | ((uint32_t)b << 16) |
+               ((uint32_t)b << 24);
+      }
+      return 0xFFFFFFFF;
+    }
     default:
       break;
     }
@@ -205,6 +241,16 @@ void Bus::write8(uint32_t addr, uint8_t value) {
     vram[addr - 0x06000000] = value;
   } else if (addr >= 0x07000000 && addr < 0x07000400) {
     oam[addr - 0x07000000] = value;
+  } else if (addr >= 0x0E000000 && addr < 0x0E010000) {
+    // SRAM / Flash 存档写入
+    if (backup)
+      backup->write8(addr & 0xFFFF, value);
+  } else if (addr >= 0x0D000000 && addr < 0x0E000000) {
+    // EEPROM 串行写入
+    if (backup && (backup->getType() == Backup::Type::EEPROM_512 ||
+                   backup->getType() == Backup::Type::EEPROM_8K)) {
+      backup->eepromWrite(value & 1);
+    }
   }
 }
 

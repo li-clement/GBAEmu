@@ -128,6 +128,9 @@ typedef struct {
       std::vector<uint8_t> romVec(romFileData.length);
       memcpy(romVec.data(), romFileData.bytes, romFileData.length);
       _gba->loadROM(romVec);
+      // 传递 ROM 路径用于推导 .sav 存档路径
+      _gba->setROMPath([romPath UTF8String]);
+      _gba->loadSave();
       _loadedRealROM = YES;
     } else {
       NSLog(@"No ROM found in rom folder, using dummy ROM");
@@ -323,8 +326,38 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
   memcpy(data.data(), romData.bytes, romData.length);
 
   [_coreLock lock];
+  // 切换 ROM 前保存当前存档
+  _gba->saveSave();
   _gba->loadROM(data);
   _gba->reset();
+  [_coreLock unlock];
+}
+
+- (void)loadROM:(NSData *)romData fromPath:(NSString *)path {
+  if (!romData || romData.length == 0)
+    return;
+  if (_gba == nullptr)
+    return;
+
+  std::vector<uint8_t> data(romData.length);
+  memcpy(data.data(), romData.bytes, romData.length);
+
+  [_coreLock lock];
+  // 切换 ROM 前保存当前存档
+  _gba->saveSave();
+  _gba->setROMPath([path UTF8String]);
+  _gba->loadROM(data);
+  // loadROM 内部会自动检测存档类型，但需要在 setROMPath 后调用 loadSave
+  _gba->loadSave();
+  _gba->reset();
+  [_coreLock unlock];
+}
+
+- (void)saveSave {
+  if (_gba == nullptr)
+    return;
+  [_coreLock lock];
+  _gba->saveSave();
   [_coreLock unlock];
 }
 
@@ -402,8 +435,13 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
   dispatch_async(_emulationQueue, ^{
     while (true) {
       MetalView *strongSelf = weakSelf;
-      if (!strongSelf || !strongSelf->_running)
+      if (!strongSelf || !strongSelf->_running) {
+        // 仿真线程退出时自动保存存档
+        if (strongSelf && strongSelf->_gba) {
+          strongSelf->_gba->saveSave();
+        }
         break;
+      }
 
       // Run Emulation (Produces 1 frame)
       // 只在 stepFrame 期间持锁，之后立即释放让渲染线程可以 memcpy VRAM
