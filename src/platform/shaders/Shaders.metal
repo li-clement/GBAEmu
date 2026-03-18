@@ -326,7 +326,7 @@ kernel void ppg_compute_shader(texture2d<float, access::write> outTexture [[text
                         finalColor = expandColor5(c15);
                     }
                 } else {
-                    uint32_t dataOffset = objVramBase + (tileIndex * 32); 
+                    uint32_t dataOffset = objVramBase + (tileIndex * 64); 
                     colorIndex = vram[dataOffset + (localTileY * 8) + localTileX];
                     if (colorIndex != 0 && prio <= bestPrio) {
                         bestPrio = prio;

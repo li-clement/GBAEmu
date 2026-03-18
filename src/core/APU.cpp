@@ -154,8 +154,6 @@ uint16_t APU::read16(uint32_t addr) {
 void APU::write16(uint32_t addr, uint16_t value) {
   uint32_t offset = addr - 0x04000000;
 
-
-
   switch (offset) {
   case IO::SOUND1CNT_L: // 0x60 Sweep
     sound1cnt_l = value;

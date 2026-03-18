@@ -3,6 +3,7 @@
 #include "Backup.h"
 #include "CPU.h"
 #include "Debugger.h"
+#include "GBA.h"
 
 namespace Core {
 
@@ -209,6 +210,10 @@ uint32_t Bus::read32(uint32_t addr) {
 }
 
 void Bus::write8(uint32_t addr, uint8_t value) {
+  if ((addr & ~3) == 0x03007FFC) {
+    printf("BUS WRITE8 addr:%08X val:%02X PC:%08X\n", addr, value, gba ? gba->getCPU().getPC() : 0);
+    fflush(stdout);
+  }
   // BIOS 区域写保护：加载真实 BIOS 后或 lockBIOSVectorTable 后整个区域只读
   // vectorTableWritable_=true 时允许写入（供 HLE handler 安装）
   if (addr < 0x00004000) {
@@ -255,6 +260,10 @@ void Bus::write8(uint32_t addr, uint8_t value) {
 }
 
 void Bus::write16(uint32_t addr, uint16_t value) {
+  if ((addr & ~3) == 0x03007FFC) {
+    printf("BUS WRITE16 addr:%08X val:%04X PC:%08X\n", addr, value, gba ? gba->getCPU().getPC() : 0);
+    fflush(stdout);
+  }
   // Write to IO
   if ((addr >> 24) == 0x04) {
     uint32_t offset = addr & 0x3FF;
@@ -262,7 +271,7 @@ void Bus::write16(uint32_t addr, uint16_t value) {
       apu->write16(addr, value);
     }
     if (offset >= 0xB0 && offset <= 0xDF) {
-      // DMA register write (no debug log)
+      if (gba) gba->setDMADirty();
     }
     if (offset == 0x202) {
       // REG_IF is acknowledge-by-writing-1
@@ -303,6 +312,10 @@ void Bus::write16(uint32_t addr, uint16_t value) {
 }
 
 void Bus::write32(uint32_t addr, uint32_t value) {
+  if ((addr & ~3) == 0x03007FFC) {
+    printf("BUS WRITE32 addr:%08X val:%08X PC:%08X\n", addr, value, gba ? gba->getCPU().getPC() : 0);
+    fflush(stdout);
+  }
   // IO Registers
   if ((addr >> 24) == 0x04) {
     uint32_t offset = addr & 0x3FF;
@@ -314,6 +327,7 @@ void Bus::write32(uint32_t addr, uint32_t value) {
     // DMA SAD/DAD 等 32 位寄存器直接写（不含 CNT_H 等需要副作用的地址）
     if (offset >= 0xB0 && offset <= 0xDF && (offset & 3) != 0xA) {
       *(uint32_t *)&io_regs[offset] = value;
+      if (gba) gba->setDMADirty(); // Added this line
       return;
     }
     // 其他 IO 通过 write16 拆分，保留副作用

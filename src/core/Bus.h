@@ -8,6 +8,7 @@ namespace Core {
 class APU;    // Forward decl
 class Backup; // Forward decl
 class CPU;    // Forward decl
+class GBA;    // Forward decl
 
 class Bus {
 public:
@@ -16,6 +17,7 @@ public:
 
   void setAPU(APU *apu) { this->apu = apu; }
   void setCPU(CPU *cpu) { this->cpu = cpu; }
+  void setGBA(GBA *gba) { this->gba = gba; }
 
   // Basic memory access
   template <typename T> T read(uint32_t addr);
@@ -44,6 +46,15 @@ public:
   const uint8_t* getVRAMPointer() const { return vram.data(); }
   const uint8_t* getOAMPointer() const { return oam.data(); }
   const uint8_t* getIORegsPointer() const { return io_regs.data(); }
+
+  // Fast direct IO access for performance hot paths
+  inline uint16_t readIO16Direct(uint16_t offset) const {
+    return *(uint16_t*)(&io_regs[offset]);
+  }
+  
+  inline void writeIO16Direct(uint16_t offset, uint16_t value) {
+    *(uint16_t*)(&io_regs[offset]) = value;
+  }
 
   // 存档后端
   void setBackup(Backup *b) { backup = b; }
@@ -79,6 +90,7 @@ private:
   APU *apu = nullptr;
   Backup *backup = nullptr;
   CPU *cpu = nullptr;
+  GBA *gba = nullptr;
 };
 
 } // namespace Core

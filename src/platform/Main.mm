@@ -94,6 +94,7 @@
 
 // Main entry point
 int main(int argc, const char *argv[]) {
+  setvbuf(stdout, NULL, _IONBF, 0);
   @autoreleasepool {
     NSApplication *app = [NSApplication sharedApplication];
     AppDelegate *delegate = [[AppDelegate alloc] init];

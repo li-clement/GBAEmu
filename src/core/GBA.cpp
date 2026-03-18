@@ -16,6 +16,7 @@ GBA::GBA() {
 
   bus->setAPU(apu.get());
   bus->setCPU(cpu.get());
+  bus->setGBA(this);
 }
 
 GBA::~GBA() {}
@@ -73,12 +74,14 @@ void GBA::step() {
 }
 
 void GBA::stepFrame(uint32_t *buffer, size_t stride) {
+  const int CYCLES_PER_LINE = 1232;
 
   for (int line = 0; line < TOTAL_LINES; line++) {
-    bus->write16(0x04000006, line);
+    // 写入当前扫描线 VCOUNT
+    bus->writeIO16Direct(0x006, line);
 
     // 更新 DISPSTAT 的 VBlank 和 VCount match 标志
-    uint16_t dispstat = bus->read16(0x04000004);
+    uint16_t dispstat = bus->readIO16Direct(0x004);
     uint8_t vcountTarget = (dispstat >> 8) & 0xFF;
 
     // 清除状态标志 (保留控制位)
@@ -97,15 +100,17 @@ void GBA::stepFrame(uint32_t *buffer, size_t stride) {
       }
     }
 
-    bus->write16(0x04000004, dispstat);
+    bus->writeIO16Direct(0x004, dispstat);
 
     // Run CPU for one scanline (1232 cycles)
-    int cyclesRun = 0;
-    while (cyclesRun < CYCLES_PER_LINE) {
-      cpu->step();
-      int stepCycles = 4;
-      cyclesRun += stepCycles;
+    int cyclesToRun = CYCLES_PER_LINE;
+    bool isDebugging = false; // Assuming isDebugging is a local variable or member, initializing for compilation
+    while (cyclesToRun > 0 && !isDebugging) {
+      // 实际跑多少周期由 CPU 决定
+      int stepCycles = cpu->step();
+      cyclesToRun -= stepCycles;
 
+      // 更新各个子系统
       updateTimers(stepCycles);
       apu->step(stepCycles);
       checkDMA();
@@ -119,12 +124,12 @@ void GBA::stepFrame(uint32_t *buffer, size_t stride) {
 
     // HBlank DMA
     if (line < VISIBLE_LINES) {
-      uint16_t hdispstat = bus->read16(0x04000004);
-      bus->write16(0x04000004, hdispstat | 2); // Set HBlank
+      uint16_t hdispstat = bus->readIO16Direct(0x004);
+      bus->writeIO16Direct(0x004, hdispstat | 2); // Set HBlank
 
       for (int c = 0; c < 4; c++) {
         uint32_t regBase = 0x04000000 + 0xB0 + (c * 0xC);
-        uint16_t cnt_h = bus->read16(regBase + 0xA);
+        uint16_t cnt_h = bus->readIO16Direct((regBase & 0x3FF) + 0xA);
         if ((cnt_h & 0x8000) && ((cnt_h >> 12) & 3) == 2) {
           transferDMA(c);
         }
@@ -133,7 +138,7 @@ void GBA::stepFrame(uint32_t *buffer, size_t stride) {
 
     // VBlank 开始时触发 VBlank IRQ 和 DMA
     if (line == VISIBLE_LINES) {
-      uint16_t dstat = bus->read16(0x04000004);
+      uint16_t dstat = bus->readIO16Direct(0x004);
       if (dstat & 0x8) {
         requestInterrupt(0x1); // VBlank IRQ
       }
@@ -185,22 +190,36 @@ void GBA::latchDMA(int c) {
 }
 
 void GBA::checkDMA() {
-  // Check all 4 channels
-  for (int i = 0; i < 4; i++) {
-    latchDMA(i);
+  if (!dmaDirty_) return;
 
-    if (!dma[i].active)
-      continue; // Not enabled
+  bool fired = false;
+  for (int c = 0; c < 4; c++) {
+    latchDMA(c);
+    
+    if (!dma[c].active) continue;
 
-    uint32_t regBase = 0x04000000 + 0xB0 + (i * 0xC);
-    uint16_t cnt_h = bus->read16(regBase + 0xA);
+    uint32_t regBase = 0x04000000 + 0xB0 + (c * 0xC);
+    
+    // 我们在这里使用直接 IO 访问，避免经过完整的 write/read 总线流程
+    // DMA 控制器地址是从 0xB0 开始的 IO 寄存器，所以 offset 是 regBase & 0x3FF
+    uint16_t cnt_h = bus->readIO16Direct((regBase & 0x3FF) + 0xA);
 
-    // Timing Mode (Bits 12-13)
-    int timing = (cnt_h >> 12) & 0x3;
-
-    if (timing == 0) { // Immediate
-      transferDMA(i);
+    if (cnt_h & 0x8000) {
+      uint16_t timing = (cnt_h >> 12) & 3;
+      if (timing == 0) { // Immediate
+        transferDMA(c);
+        fired = true;
+      }
     }
+  }
+  
+  // 一旦处理完毕就清除标记
+  if (fired) {
+    dmaDirty_ = false;
+  } else {
+    // 依然等待其它 timing（HBlank/VBlank）的 trigger，保持 dirty
+    // 但我们的 dmaDirty_ 主要是指 "使能状态发生了改变，可能需要 Immediate"
+    dmaDirty_ = false; 
   }
 }
 
@@ -570,21 +589,21 @@ void GBA::updateTimers(int cycles) {
   }
 }
 
-void GBA::requestInterrupt(int id) {
-  bus->requestInterrupt(id);
-  // printf("GBA: Request Interrupt ID=%X IF=%04X\n", id, if_reg | id);
+void GBA::requestInterrupt(uint16_t flag) {
+  uint16_t currentIF = bus->readIO16Direct(0x202);
+  bus->writeIO16Direct(0x202, currentIF | flag);
   checkInterrupts();
 }
 
 void GBA::checkInterrupts() {
-  uint16_t ie = bus->read16(0x04000200);
-  uint16_t if_reg = bus->read16(0x04000202);
-  uint16_t ime = bus->read16(0x04000208);
+  uint16_t ie = bus->readIO16Direct(0x200);
+  uint16_t if_reg = bus->readIO16Direct(0x202);
+  uint16_t ime = bus->readIO16Direct(0x208);
 
   // Prevent infinite recursive interrupting
   if ((ime & 1) && cpu->isIRQEnabled()) {
     if (ie & if_reg) {
-      // printf("GBA: Firing CPU IRQ! IE&IF=%04X\n", ie & if_reg);
+      cpu->setHalted(false);
       cpu->irq();
     } else {
       // IME is on but no matching interrupt

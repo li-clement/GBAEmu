@@ -1,8 +1,8 @@
 #include "Backup.h"
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
-#include <cstdio>
 
 namespace Core {
 
@@ -53,11 +53,11 @@ Backup::Backup(Type type) : type_(type) {
     break;
   case Type::Flash64:
     data_.resize(64 * 1024, 0xFF); // 64KB
-    flashChipId_ = 0x1CC2;        // Macronix MX29L512 (常见)
+    flashChipId_ = 0x1CC2;         // Macronix MX29L512 (常见)
     break;
   case Type::Flash128:
     data_.resize(128 * 1024, 0xFF); // 128KB
-    flashChipId_ = 0x09C2;         // Macronix MX29L010 (常见)
+    flashChipId_ = 0x09C2;          // Macronix MX29L010 (常见)
     break;
   case Type::EEPROM_512:
     data_.resize(512, 0xFF); // 512 字节
@@ -114,7 +114,7 @@ uint8_t Backup::flashRead(uint32_t addr) const {
   // ID 模式下特殊返回
   if (flashState_ == FlashState::IDMode) {
     if (offset == 0x0000)
-      return flashChipId_ & 0xFF;        // 制造商 ID
+      return flashChipId_ & 0xFF; // 制造商 ID
     if (offset == 0x0001)
       return (flashChipId_ >> 8) & 0xFF; // 设备 ID
     return 0;
@@ -204,12 +204,10 @@ void Backup::flashWrite(uint32_t addr, uint8_t value) {
       dirty_ = true;
     } else if (value == 0x30) {
       // 扇区擦除 (4KB) — offset 高4位确定扇区
-      uint32_t sectorStart =
-          (uint32_t)flashBank_ * 0x10000 + (offset & 0xF000);
+      uint32_t sectorStart = (uint32_t)flashBank_ * 0x10000 + (offset & 0xF000);
       uint32_t sectorEnd = sectorStart + 0x1000;
       if (sectorEnd <= data_.size()) {
-        std::fill(data_.begin() + sectorStart, data_.begin() + sectorEnd,
-                  0xFF);
+        std::fill(data_.begin() + sectorStart, data_.begin() + sectorEnd, 0xFF);
         dirty_ = true;
       }
     }

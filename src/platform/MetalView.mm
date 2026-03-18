@@ -9,6 +9,8 @@
 #include <thread>
 #include <vector>
 
+#include "RingBuffer.h"
+
 // 简单顶点结构
 typedef struct {
   vector_float2 position;
@@ -33,7 +35,7 @@ typedef struct {
   AudioQueueRef _audioQueue;
   AudioQueueBufferRef _audioBuffers[3];
   NSLock *_audioLock;
-  std::vector<int16_t> _audioRingBuffer;
+  Core::RingBuffer<int16_t> *_audioRingBuffer;
 
   id<MTLBuffer> _vertexBuffer;
 
@@ -216,15 +218,15 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
   [self->_audioLock lock];
 
   size_t bytesToCopy = buffer->mAudioDataBytesCapacity;
-  size_t availableBytes = _audioRingBuffer.size() * sizeof(int16_t);
+  size_t samplesToCopy = bytesToCopy / sizeof(int16_t);
+  size_t availableSamples = _audioRingBuffer->size();
 
-  if (availableBytes < bytesToCopy) {
-    // Not enough data, pad with silence or just copy what we have?
-    // Let's pad with silence for now to avoid stalling
+  if (availableSamples < samplesToCopy) {
+    // 设置全零以防出现爆音，并将剩余数据全部 pop 出来
     memset(buffer->mAudioData, 0, bytesToCopy);
-    // Copy what we have
-    memcpy(buffer->mAudioData, _audioRingBuffer.data(), availableBytes);
-    _audioRingBuffer.clear();
+    if (availableSamples > 0) {
+      _audioRingBuffer->pop((int16_t *)buffer->mAudioData, availableSamples);
+    }
     buffer->mAudioDataByteSize = (UInt32)bytesToCopy;
     
     // We drained the buffer, wake up the emulation thread!
@@ -233,13 +235,10 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
     static int starvLog = 0;
     if (starvLog++ % 60 == 0) {
       NSLog(@"AUDIO STARVATION: Needed %zu but had %zu", bytesToCopy,
-            availableBytes);
+            availableSamples * sizeof(int16_t));
     }
   } else {
-    memcpy(buffer->mAudioData, _audioRingBuffer.data(), bytesToCopy);
-    _audioRingBuffer.erase(_audioRingBuffer.begin(),
-                           _audioRingBuffer.begin() +
-                               (bytesToCopy / sizeof(int16_t)));
+    _audioRingBuffer->pop((int16_t *)buffer->mAudioData, samplesToCopy);
     buffer->mAudioDataByteSize = (UInt32)bytesToCopy;
     
     // Signal that space might be freed
@@ -313,6 +312,7 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
       dispatch_queue_create("com.gbaemu.core", DISPATCH_QUEUE_SERIAL);
   _displayLock = [[NSLock alloc] init];
 
+  _audioRingBuffer = new Core::RingBuffer<int16_t>(32768); // 32K samples buffer
   [self setupAudio];
 }
 
@@ -458,14 +458,16 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
       {
         [strongSelf->_audioCondition lock];
         [strongSelf->_audioLock lock];
-        while (strongSelf->_running && strongSelf->_audioRingBuffer.size() > 4096) {
+        
+        // 我们等待直到 RingBuffer 有足够空间 (需要最多保留 audioCopy 的容量)
+        while (strongSelf->_running && strongSelf->_audioRingBuffer->size() > 8192) {
           [strongSelf->_audioLock unlock];
           [strongSelf->_audioCondition wait];
           [strongSelf->_audioLock lock];
         }
         
-        strongSelf->_audioRingBuffer.insert(strongSelf->_audioRingBuffer.end(),
-                                            audioCopy.begin(), audioCopy.end());
+        strongSelf->_audioRingBuffer->push(audioCopy.data(), audioCopy.size());
+        
         [strongSelf->_audioLock unlock];
         [strongSelf->_audioCondition unlock];
       }
@@ -526,7 +528,7 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
     [computeEncoder setBuffer:_vramBuffer offset:0 atIndex:0];
     [computeEncoder setBytes:bus.getPalettePointer() length:1024 atIndex:1];
     [computeEncoder setBytes:bus.getOAMPointer()     length:1024 atIndex:2];
-    [computeEncoder setBytes:bus.getIORegsPointer()  length:1024 atIndex:3];
+    [computeEncoder setBytes:bus.getIORegsPointer()  length:4096 atIndex:3];
   }
   [self->_coreLock unlock];
 

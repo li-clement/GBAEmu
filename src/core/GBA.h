@@ -21,7 +21,10 @@ public:
   void stepFrame(uint32_t *buffer, size_t stride); // Run a full frame
 
   // Input
-  void setKeyStatus(uint16_t keyMask, bool pressed);
+  void setKeyStatus(uint16_t mask, bool pressed);
+
+  // DMA Event Driven Trigger
+  inline void setDMADirty() { dmaDirty_ = true; }
 
   // ROM / BIOS Loading
   void loadBIOS(const std::vector<uint8_t> &data);
@@ -46,6 +49,8 @@ private:
   std::unique_ptr<Backup> backup;
 
   std::string romPath_;  // ROM 文件路径（用于推导 .sav 路径）
+  
+  bool dmaDirty_ = false;
 
   // Timers
   struct Timer {
@@ -56,7 +61,8 @@ private:
   } timers[4];
 
   void updateTimers(int cycles);
-  void requestInterrupt(int id);
+  // Interrupts
+  void requestInterrupt(uint16_t flag);
   void checkInterrupts();
 
   // DMA

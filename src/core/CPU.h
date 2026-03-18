@@ -51,7 +51,7 @@ public:
   void setHasBIOS(bool b) { hasBIOS_ = b; }
   void
   setEntryPoint(uint32_t addr); // 设置 PC 并重填流水线（有 BIOS 时从 0 启动）
-  void step();
+  int step(); // 返回消耗的 CPU 周期数
 
   void irq();
 
@@ -95,15 +95,40 @@ private:
   bool pipelineFlushed;
   bool halted = false;   // SWI IntrWait/VBlankIntrWait 暂停 CPU
   bool hasBIOS_ = false; // 是否加载了真实 BIOS
+  int lastCycles_ = 0;   // 上一条指令消耗的周期数
 
   // Instruction decoding
   void executeARM(uint32_t opcode);
-  void executeThumb(uint16_t opcode); // Later
+  void executeThumb(uint16_t opcode);
 
   // Fast CPU Decode Lookup Tables
   typedef void (CPU::*ArithHandler)(uint32_t);
-  ArithHandler armTable[4096]; // Top 12 bits of typical ARM opcode
+  ArithHandler armTable[4096]; // ARM: bits [27:16] 作为索引
+
+  typedef void (CPU::*ThumbHandler)(uint16_t);
+  ThumbHandler thumbTable[256]; // Thumb: bits [15:8] 作为索引
+
   void initDecodeTables();
+
+  // Thumb Format handlers
+  void thumbFormat1(uint16_t opcode);  // Move Shifted Register
+  void thumbFormat2(uint16_t opcode);  // Add/Sub
+  void thumbFormat3(uint16_t opcode);  // MOV/CMP/ADD/SUB Immediate
+  void thumbFormat4(uint16_t opcode);  // ALU Operations
+  void thumbFormat5(uint16_t opcode);  // Hi-Register / BX
+  void thumbFormat6(uint16_t opcode);  // PC-relative Load
+  void thumbFormat78(uint16_t opcode); // Load/Store Register Offset
+  void thumbFormat9(uint16_t opcode);  // Load/Store Immediate Offset
+  void thumbFormat10(uint16_t opcode); // Load/Store Halfword
+  void thumbFormat11(uint16_t opcode); // SP-relative Load/Store
+  void thumbFormat12(uint16_t opcode); // Load Address
+  void thumbFormat13(uint16_t opcode); // Add Offset to SP
+  void thumbFormat14(uint16_t opcode); // Push/Pop
+  void thumbFormat15(uint16_t opcode); // Multiple Load/Store
+  void thumbFormat16(uint16_t opcode); // Conditional Branch
+  void thumbFormat18(uint16_t opcode); // Unconditional Branch
+  void thumbFormat19(uint16_t opcode); // Long Branch with Link
+  void thumbSWI(uint16_t opcode);      // Thumb SWI 包装
 
   bool checkCondition(uint32_t cond);
 
