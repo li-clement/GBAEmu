@@ -31,6 +31,10 @@
 - `-mcpu=apple-m1` 启用 Apple Silicon 原生指令集优化
 - `-arch arm64` 原生 ARM64 编译
 
+## 运行效果
+
+![模拟器运行截图](screenshots/screenshot-2026-04-25.png)
+
 ## 编译与运行
 
 1. **载入 ROM 游戏**: 将 `.gba` 游戏文件放置于 `rom/` 文件夹中。
