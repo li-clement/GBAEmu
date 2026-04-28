@@ -21,20 +21,70 @@ vertex VertexOut vertexShader(uint vertexID [[ vertex_id ]],
     return out;
 }
 
-// 简单的片段着色器，采样纹理
-fragment float4 fragmentShader(VertexOut in [[ stage_in ]],
-                               texture2d<float> colorTexture [[ texture(0) ]]) {
-    constexpr sampler textureSampler (mag_filter::nearest,
-                                      min_filter::nearest);
-    return colorTexture.sample(textureSampler, in.textureCoordinate);
-}
-
-// 颜色解包通用函数：15 位色（5-5-5）映射至归一化全空间 rgba (0.0~1.0)
+// 颜色解包：15 位色（5-5-5）映射至归一化 rgba
 inline float4 expandColor5(uint16_t color15) {
     float r = float(color15 & 0x1F) / 31.0f;
     float g = float((color15 >> 5) & 0x1F) / 31.0f;
     float b = float((color15 >> 10) & 0x1F) / 31.0f;
     return float4(r, g, b, 1.0f);
+}
+
+// 片段着色器：采样 + CAS 锐化（inlined，无中间 texture）
+fragment float4 fragmentShader(VertexOut in [[ stage_in ]],
+                              texture2d<float> colorTexture [[ texture(0) ]],
+                              constant uint &casScale [[buffer(1)]]) {
+    constexpr sampler textureSampler (mag_filter::nearest,
+                                      min_filter::nearest,
+                                      address::clamp_to_edge);
+
+    // 3x3 邻域 UV 偏移（单位：纹理坐标）
+    float2 texSize = float2(colorTexture.get_width(),
+                           colorTexture.get_height());
+    float2 stepUV = 1.0 / texSize;
+
+    float2 uv = in.textureCoordinate;
+
+    // 邻域 9 点采样（center + 4-directional）
+    float3 b = colorTexture.sample(textureSampler, uv + float2( 0.0, -stepUV.y)).rgb;
+    float3 d = colorTexture.sample(textureSampler, uv + float2(-stepUV.x,  0.0)).rgb;
+    float3 e = colorTexture.sample(textureSampler, uv + float2( 0.0,  0.0)).rgb;
+    float3 f = colorTexture.sample(textureSampler, uv + float2( stepUV.x,  0.0)).rgb;
+    float3 h = colorTexture.sample(textureSampler, uv + float2( 0.0,  stepUV.y)).rgb;
+
+    // CAS off：直接返回原色
+    if (casScale >= 16) return float4(e, 1.0);
+
+    // Luma 用绿色通道近似（GBA 调色盘图像绿色通道对比度最佳）
+    float bL = b.g, dL = d.g, eL = e.g, fL = f.g, hL = h.g;
+
+    // 对比度检测（噪声/细节感知）
+    float nz = 0.25 * (bL + dL + fL + hL) - eL;
+    float con = abs(nz) * rsqrt(
+        max(max(max(bL, dL), max(eL, fL)), max(hL, 1e-10f)) -
+        min(min(min(bL, dL), min(eL, fL)), hL));
+    nz = 1.0 - 0.5 * saturate(con);
+
+    // Ring min/max（用于 lobe 限制）
+    half3 mn4 = min(min(half3(b), half3(d)), min(half3(f), half3(h)));
+    half3 mx4 = max(max(half3(b), half3(d)), max(half3(f), half3(h)));
+
+    // CAS sharpness：0 = 最大锐化，N = 降低 N 档
+    half sharp = 0.0h;
+    if (casScale > 0) sharp = exp2(-half(casScale));
+
+    // lobe 限制计算
+    half hitMin = min(mn4.g, half(e.g)) / max(mx4.g * 4.0h, 1e-10h);
+    half hitMax = (1.0h - max(mx4.g, half(e.g))) / max(mn4.g * 4.0h, 1e-10h);
+    half lobe = max(-hitMin, hitMax);
+    lobe = clamp(lobe, -1.0h, 0.0h) * sharp;
+    lobe *= half(nz);
+
+    // 最终输出
+    half3 outRGB = (lobe * (half3(b) + half3(d) + half3(f) + half3(h)) + half3(e))
+                   / (1.0h + 4.0h * lobe);
+    outRGB = clamp(outRGB, 0.0h, 1.0h);
+
+    return float4(float3(outRGB), 1.0);
 }
 
 // ======================================

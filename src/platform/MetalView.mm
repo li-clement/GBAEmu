@@ -48,6 +48,7 @@ typedef struct {
   NSLock *_coreLock;    // Protects _gba access
   NSCondition *_audioCondition; // Replaces sleep for fine-grain sync
   id<MTLComputePipelineState> _computePipelineState;
+  id<MTLBuffer> _casScaleBuffer; // CAS sharpness scale param (buffer slot 1)
   id<MTLBuffer> _vramBuffer;
   id<MTLBuffer> _palBuffer;
   id<MTLBuffer> _oamBuffer;
@@ -308,6 +309,13 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
 
   _displayTexture = [self.device newTextureWithDescriptor:textureDescriptor];
 
+  // CAS scale buffer (0 = max sharp, N = N stops reduction, default 0)
+  // buffer slot 1 matches fragment shader's buffer(1) binding
+  uint casScale = 0;
+  _casScaleBuffer = [self.device newBufferWithBytes:&casScale
+                                            length:sizeof(uint)
+                                           options:MTLResourceStorageModeShared];
+
   _emulationQueue =
       dispatch_queue_create("com.gbaemu.core", DISPATCH_QUEUE_SERIAL);
   _displayLock = [[NSLock alloc] init];
@@ -538,7 +546,7 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
             threadsPerThreadgroup:threadsPerThreadgroup];
   [computeEncoder endEncoding];
 
-  // Display Phase
+  // Display Phase — fragment shader does CAS inlined (no extra compute pass)
   MTLRenderPassDescriptor *renderPassDescriptor =
       view.currentRenderPassDescriptor;
   if (renderPassDescriptor != nil) {
@@ -552,7 +560,10 @@ static void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ,
 
     [renderEncoder setRenderPipelineState:_pipelineState];
     [renderEncoder setVertexBuffer:_vertexBuffer offset:0 atIndex:0];
+    // 采样 PPU 输出（含 CAS inlined in fragment shader）
     [renderEncoder setFragmentTexture:_displayTexture atIndex:0];
+    // CAS scale param (buffer slot 1)
+    [renderEncoder setFragmentBuffer:_casScaleBuffer offset:0 atIndex:1];
 
     [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle
                       vertexStart:0
