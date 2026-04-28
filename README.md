@@ -19,6 +19,7 @@
 - 支持 Mode 0/1/2 平铺背景与 Mode 3/4/5 位图模式
 - Sprite (OBJ) 渲染与图层优先级管理
 - 仿真线程与渲染线程解耦，通过精细化锁管理避免帧率抖动
+- **AMD FidelityFX CAS 锐化**：CAS 逻辑直接内联至显示渲染通道，利用 Metal 硬件采样器批量读取 3x3 邻域像素，无中间 texture 开销，零性能损耗地提升画面清晰度
 
 ### 🔊 DirectSound 音频系统
 - FIFO A/B 双通道 DirectSound 流式播放
